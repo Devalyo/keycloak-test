@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-keycloak"
+version = "0.1.0"
+description = "Local account and password reset service"
+requires-python = ">=3.10"
+dependencies = ["Flask>=3.1,<4"]
+
+[project.scripts]
+mini-keycloak = "mini_keycloak.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mini_keycloak*"]
