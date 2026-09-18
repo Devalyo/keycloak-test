@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+deploy/*.crt
+deploy/*.key
+deploy/*.pem

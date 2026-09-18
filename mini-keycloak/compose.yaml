@@ -1,0 +1,109 @@
+x-app: &app
+  image: ${COMPOSE_PROJECT_NAME:-mini-keycloak}-app:local
+  build:
+    context: .
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  stop_grace_period: 40s
+  networks: [database]
+  environment:
+    MINI_KEYCLOAK_PROFILE: production
+    MINI_KEYCLOAK_DATABASE_URL: postgresql+psycopg://mini_keycloak:${POSTGRES_PASSWORD:?Set an independent hexadecimal database password}@postgres:5432/mini_keycloak?connect_timeout=5
+    MINI_KEYCLOAK_SECRET_KEY: ${MINI_KEYCLOAK_SECRET_KEY:?Set a stable application secret of at least 32 bytes}
+    MINI_KEYCLOAK_OIDC_KEY_ENCRYPTION_SECRET: ${MINI_KEYCLOAK_OIDC_KEY_ENCRYPTION_SECRET:?Set an independent stable master secret of at least 32 bytes}
+    MINI_KEYCLOAK_EXTERNAL_URL: https://localhost:${MINI_KEYCLOAK_HTTPS_PORT:-8443}
+    MINI_KEYCLOAK_SESSION_COOKIE_SECURE: "true"
+    MINI_KEYCLOAK_TRUSTED_HOSTS: localhost
+    MINI_KEYCLOAK_PROXY_MODE: xforwarded
+    MINI_KEYCLOAK_PROXY_HOPS: "1"
+    MINI_KEYCLOAK_TRUSTED_PROXY_CIDRS: ${MINI_KEYCLOAK_PROXY_ADDRESS:-172.30.83.254}/32
+    MINI_KEYCLOAK_GUNICORN_HOST: 0.0.0.0
+    MINI_KEYCLOAK_GUNICORN_PORT: "8000"
+
+services:
+  postgres:
+    # Verified official multi-architecture manifest: postgres:17.11-alpine3.24
+    image: postgres@sha256:f02121de6f74d30d8a94cd1d9584125e2178d7e6c377d8130112d4e52d867995
+    environment:
+      POSTGRES_DB: mini_keycloak
+      POSTGRES_USER: mini_keycloak
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set an independent hexadecimal database password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [database]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U mini_keycloak -d mini_keycloak"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: [flask, --app, "mini_keycloak.app:create_app", db, upgrade]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  bootstrap:
+    <<: *app
+    command: [flask, --app, "mini_keycloak.app:create_app", bootstrap-demo]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  web:
+    <<: *app
+    networks: [database, proxy]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    # Verified official multi-architecture manifest: caddy:2.11.4-alpine
+    image: caddy@sha256:de23def33b17fb5d1290b0f6c2add1d70780e52341896c00a4c8a2a2fe9d355e
+    ports:
+      - "127.0.0.1:${MINI_KEYCLOAK_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      gateway:
+      proxy:
+        # Web trusts this one direct peer, never the subnet or forwarded Host.
+        # Use the high endpoint to avoid the earlier-starting web's dynamic IP.
+        ipv4_address: ${MINI_KEYCLOAK_PROXY_ADDRESS:-172.30.83.254}
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  database:
+    internal: true
+  proxy:
+    internal: true
+    ipam:
+      config:
+        # Override subnet/address together only when another local environment overlaps.
+        - subnet: ${MINI_KEYCLOAK_PROXY_SUBNET:-172.30.83.0/24}
+  gateway:
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
