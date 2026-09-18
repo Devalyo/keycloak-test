@@ -14,6 +14,7 @@ from werkzeug.exceptions import HTTPException
 from mini_keycloak.authentication import AuthenticationProcessor, AuthenticatorRegistry, browser
 from mini_keycloak.authentication.browser import (
     complete_authentication, login_page as _login_page, session_service,
+    validate_stored_authorization,
 )
 from mini_keycloak.authentication.constants import (
     AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED, RESET_CREDENTIALS_CHOOSE_USER,
@@ -131,10 +132,11 @@ def _processor(realm: str, session: AuthenticationSession) -> AuthenticationProc
 def _flow_response(realm: str, processor: AuthenticationProcessor, outcome):
     session = processor.authentication_session
     if outcome.complete:
+        enabled_realm, client = validate_stored_authorization(realm, session)
         user = processor.user
         if user is None:
             abort(400)
-        user_session = session_service().create(session.realm, session.client, user)
+        user_session = session_service().create(enabled_realm, client, user)
         return complete_authentication(BrowserAuthenticationResult(session, user_session))
     if outcome.page in {'account', 'selector'}:
         execution = processor.repository.get_execution(session.realm_id, outcome.execution_id)

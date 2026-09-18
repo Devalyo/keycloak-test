@@ -84,6 +84,14 @@ def validate_authorization(realm_name, args):
     return realm, client
 
 
+def validate_stored_authorization(realm_name, session):
+    """Revalidate the original request against current realm and client policy."""
+    parameters = {name: getattr(session, name) for name in OIDC_FIELDS}
+    parameters['client_id'] = session.client.client_id
+    return validate_authorization(realm_name, MultiDict(
+        {key: value for key, value in parameters.items() if value is not None}))
+
+
 def browser_sid():
     serializer = current_app.session_interface.get_signing_serializer(current_app)
     try:
@@ -203,10 +211,7 @@ def authenticate(realm):
     supplied_token = request.cookies.get(PREAUTH_COOKIE_PREFIX + session.tab_id, '')
     if not hmac.compare_digest(supplied_token.encode(), preauth_token(session).encode()):
         abort(400)
-    parameters = {name: getattr(session, name) for name in OIDC_FIELDS}
-    parameters['client_id'] = session.client.client_id
-    enabled_realm, client = validate_authorization(realm, MultiDict(
-        {key: value for key, value in parameters.items() if value is not None}))
+    enabled_realm, client = validate_stored_authorization(realm, session)
     throttle = LoginThrottle.from_config(db.session, current_app.config)
     try:
         user, bucket_hash = throttle.authenticate(enabled_realm.id, request.form.get('username', ''),

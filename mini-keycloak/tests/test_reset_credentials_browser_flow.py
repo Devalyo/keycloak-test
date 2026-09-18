@@ -27,16 +27,16 @@ RESET = '/realms/demo/login-actions/reset-credentials'
 CONTINUE = '/realms/demo/login-actions/action-token'
 
 
-def begin_reset(client):
-    authorization = client.get(AUTH, query_string=PARAMS)
+def begin_reset(client, *, parameters=None):
+    authorization = client.get(AUTH, query_string=PARAMS if parameters is None else parameters)
     tab_id = query_value(form_action(authorization.text, 'login-actions/authenticate'), 'tab_id')
     entry = client.get(RESET, query_string=dict(client_id='demo-app', tab_id=tab_id))
     assert entry.status_code == 200
     return tab_id, form_action(entry.text, 'login-actions/reset-credentials')
 
 
-def send_reset(app, client, *, selector=False):
-    tab_id, action = begin_reset(client)
+def send_reset(app, client, *, selector=False, parameters=None):
+    tab_id, action = begin_reset(client, parameters=parameters)
     if selector:
         assert client.post(action, data={'tryAnotherWay': ''}).status_code == 200
     response = client.post(action, data={'username': 'demo-user'})
@@ -48,8 +48,8 @@ def send_reset(app, client, *, selector=False):
         return tab_id, message.action_token
 
 
-def password_action(app, client):
-    tab_id, raw = send_reset(app, client, selector=True)
+def password_action(app, client, *, parameters=None):
+    tab_id, raw = send_reset(app, client, selector=True, parameters=parameters)
     response = client.get(CONTINUE, query_string={'key': raw})
     assert response.status_code == 200
     return tab_id, form_action(response.text, 'login-actions/required-action')
@@ -233,6 +233,49 @@ def test_completion_uses_one_database_commit(app, client):
             event.remove(session, 'after_commit', committed)
     assert response.status_code == 302
     assert len(commits) == 1
+
+
+@pytest.mark.parametrize('change', ['redirect_uri', 'scope', 'pkce'])
+def test_completion_revalidates_current_client_configuration(app, client, change):
+    parameters = dict(PARAMS)
+    if change == 'pkce':
+        parameters.pop('code_challenge')
+        parameters.pop('code_challenge_method')
+    tab_id, action = password_action(app, client, parameters=parameters)
+    with app.app_context():
+        auth = db.session.get(AuthenticationSession, tab_id)
+        original_execution = auth.current_execution
+        original_status = dict(auth.execution_status)
+        original_notes = dict(auth.auth_notes)
+        if change == 'redirect_uri':
+            auth.client.redirect_uris = ['https://configured.example.test/callback']
+        elif change == 'scope':
+            auth.client.default_scopes = ['openid', 'email']
+            auth.client.optional_scopes = []
+        else:
+            assert auth.client.pkce_policy == 'optional'
+            auth.client.pkce_policy = 'S256'
+        db.session.commit()
+
+    response = client.post(action, data={
+        'password-new': 'NewPassw0rd!', 'password-confirm': 'NewPassw0rd!'})
+    assert response.status_code == 400
+    assert response.data == client.get(CONTINUE).data
+    assert 'Location' not in response.headers
+    assert 'Set-Cookie' not in response.headers
+    with app.app_context():
+        auth = db.session.get(AuthenticationSession, tab_id)
+        assert auth.current_execution == original_execution
+        assert auth.execution_status == original_status
+        assert auth.auth_notes == original_notes
+        assert AUTHENTICATION_FLOW_COMPLETED not in auth.auth_notes
+        assert IdentityRepository(db.session).password_matches(auth.selected_user, 'DemoPassw0rd!')
+        assert not IdentityRepository(db.session).password_matches(auth.selected_user, 'NewPassw0rd!')
+        assert db.session.scalar(select(func.count()).select_from(UserSession)) == 0
+        assert db.session.scalar(select(func.count()).select_from(AuthorizationCode)) == 0
+        assert set(db.session.scalars(select(SecurityEvent.event_type))) == {'SEND_RESET_PASSWORD'}
+        for field in ('redirect_uri', 'scope', 'state', 'nonce', 'code_challenge', 'code_challenge_method'):
+            assert getattr(auth, field) == parameters.get(field)
 
 
 @pytest.mark.parametrize('account', ['known', 'unknown', 'disabled', 'no_email'])
