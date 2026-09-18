@@ -166,14 +166,23 @@ def test_reset_pending_email_execution_completes_authorization(app, client):
     with app.app_context():
         auth = db.session.get(AuthenticationSession, tab_id)
         user = db.session.get(User, auth.selected_user_id)
-        code = db.session.scalar(select(AuthorizationCode))
-        session = db.session.scalar(select(UserSession))
+        codes = list(db.session.scalars(select(AuthorizationCode)))
+        sessions = list(db.session.scalars(select(UserSession)))
+        assert len(codes) == len(sessions) == 1
+        code, session = codes[0], sessions[0]
         assert user.email_verified
         assert IdentityRepository(db.session).password_matches(user, 'NewPassw0rd!')
-        assert code.user_id == session.user_id == user.id
+        assert (code.realm_id, code.client_id, code.user_id, code.user_session_id) == (
+            auth.realm_id, auth.client_id, user.id, session.id)
         assert db.session.scalar(select(func.count()).select_from(ResetEmail)) == 1
-        assert db.session.scalar(select(func.count()).select_from(SecurityEvent).where(
-            SecurityEvent.event_type == 'SEND_RESET_PASSWORD')) == 1
+        events = list(db.session.scalars(select(SecurityEvent)))
+        assert sorted(event.event_type for event in events) == [
+            'LOGIN', 'SEND_RESET_PASSWORD', 'UPDATE_CREDENTIAL', 'UPDATE_PASSWORD']
+        for event in events:
+            assert (event.realm_id, event.client_id, event.user_id) == (
+                auth.realm_id, auth.client_id, user.id)
+        login = next(event for event in events if event.event_type == 'LOGIN')
+        assert login.user_session_id == session.id
     exchange = client.post('/realms/demo/protocol/openid-connect/token', data={
         'grant_type': 'authorization_code', 'client_id': 'demo-app',
         'code': query['code'][0], 'redirect_uri': PARAMS['redirect_uri'], 'code_verifier': VERIFIER})

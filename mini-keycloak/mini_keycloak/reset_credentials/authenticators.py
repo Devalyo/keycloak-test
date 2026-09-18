@@ -34,6 +34,19 @@ def _validated_user(context):
     return user if message is not None else None
 
 
+def _preceding_required_executions_succeeded(context):
+    flow_id = context.authentication_session.flow_id
+    if flow_id is None:
+        return False
+    for execution in context.repository.executions(flow_id):
+        if execution.id == context.execution.id:
+            return True
+        if (execution.requirement == "REQUIRED"
+                and context.authentication_session.execution_status.get(execution.id) != FlowStatus.SUCCESS.value):
+            return False
+    return False
+
+
 def _failure():
     return AuthenticatorResult(FlowStatus.FAILURE, page="error",
                                message="Invalid authentication request", error="invalid_request")
@@ -90,13 +103,15 @@ class ResetCredentialEmail:
 class ResetPassword:
     def authenticate(self, context):
         user = context.user
-        if user is None or not user.enabled:
+        if (user is None or not user.enabled
+                or not _preceding_required_executions_succeeded(context)):
             return _failure()
         return AuthenticatorResult(FlowStatus.CHALLENGE, page="password")
 
     def action(self, context, form: Mapping[str, str]):
         user = context.user
-        if user is None or not user.enabled:
+        if (user is None or not user.enabled
+                or not _preceding_required_executions_succeeded(context)):
             return _failure()
         password = form.get("password-new", "")
         policy = context.realm.password_policy

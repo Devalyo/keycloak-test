@@ -354,22 +354,62 @@ def test_authenticator_competing_delivery_rejects_stale_session(reset):
     assert db.session.scalar(select(func.count(SecurityEvent.id))) == 1
 
 
-@pytest.mark.parametrize("stage", ["email", "password"])
-@pytest.mark.parametrize("account", ["unavailable", "disabled"])
-def test_authenticator_actions_reject_unavailable_selected_user(reset, authenticators, stage, account):
+@pytest.mark.parametrize("stage", ["email_action", "password_authenticate", "password_action"])
+@pytest.mark.parametrize("account", ["absent", "disabled"])
+def test_authenticator_rejects_unavailable_selected_user(reset, stage, account):
     _, _, user, auth, executions = reset
-    if account == "unavailable":
+    if account == "absent":
         auth.selected_user_id = None
     else:
         user.enabled = False
     from mini_keycloak.authentication import AuthenticatorContext, FlowStatus
     from mini_keycloak.reset_credentials.authenticators import ResetCredentialEmail, ResetPassword
-    index = 1 if stage == "email" else 2
+    index = 1 if stage == "email_action" else 2
+    if index == 2:
+        auth.execution_status = {execution.id: "SUCCESS" for execution in executions[:2]}
     context = AuthenticatorContext(AuthenticationRepository(db.session), auth, reset[0], reset[1], executions[index])
-    provider = ResetCredentialEmail(service()) if stage == "email" else ResetPassword()
-    outcome = provider.action(context, {"password-new": "ChangedPassw0rd!", "password-confirm": "ChangedPassw0rd!"})
+    if account == "absent":
+        assert context.user is None
+    else:
+        assert context.user is user and not context.user.enabled
+    if stage == "email_action":
+        outcome = ResetCredentialEmail(service()).action(context, {})
+    elif stage == "password_authenticate":
+        outcome = ResetPassword().authenticate(context)
+    else:
+        outcome = ResetPassword().action(context, {
+            "password-new": "ChangedPassw0rd!", "password-confirm": "ChangedPassw0rd!"})
     assert outcome.status == FlowStatus.FAILURE
     assert IdentityRepository(db.session).password_matches(user, "OriginalPassw0rd!")
+
+
+@pytest.mark.parametrize("method", ["authenticate", "action"])
+def test_reset_password_rejects_premature_provider_invocation(reset, method):
+    from mini_keycloak.authentication import AuthenticatorContext, FlowStatus
+    from mini_keycloak.models import SecurityEvent
+    from mini_keycloak.reset_credentials.authenticators import ResetPassword
+    realm, client, user, auth, executions = reset
+    context = AuthenticatorContext(AuthenticationRepository(db.session), auth, realm, client, executions[2])
+    if method == "authenticate":
+        outcome = ResetPassword().authenticate(context)
+    else:
+        outcome = ResetPassword().action(context, {
+            "password-new": "ChangedPassw0rd!", "password-confirm": "ChangedPassw0rd!"})
+    assert outcome.status == FlowStatus.FAILURE
+    assert IdentityRepository(db.session).password_matches(user, "OriginalPassw0rd!")
+    assert db.session.scalar(select(func.count(SecurityEvent.id))) == 0
+
+
+def test_processor_rejects_out_of_order_password_action(reset, authenticators):
+    from mini_keycloak.models import SecurityEvent
+    _, _, user, auth, executions = reset
+    auth.selected_user_id = user.id
+    outcome = authenticators.process_action(executions[2].id, {
+        "password-new": "ChangedPassw0rd!", "password-confirm": "ChangedPassw0rd!"})
+    assert outcome.page == "error"
+    assert auth.execution_status[executions[2].id] == "FAILURE"
+    assert IdentityRepository(db.session).password_matches(user, "OriginalPassw0rd!")
+    assert db.session.scalar(select(func.count(SecurityEvent.id))) == 0
 
 
 def test_authenticator_email_action_verifies_selected_enabled_user(reset, authenticators):
