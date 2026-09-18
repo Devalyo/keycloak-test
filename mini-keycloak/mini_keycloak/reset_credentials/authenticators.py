@@ -80,20 +80,23 @@ class ResetCredentialEmail:
         return AuthenticatorResult(FlowStatus.FORK, page="login", message=RESET_MESSAGE)
 
     def action(self, context, form: Mapping[str, str]):
-        if _validated_user(context) is None:
+        user = context.user
+        if user is None or not user.enabled:
             return _failure()
+        user.email_verified = True
         return AuthenticatorResult(FlowStatus.SUCCESS)
 
 
 class ResetPassword:
     def authenticate(self, context):
-        if _validated_user(context) is None:
+        user = context.user
+        if user is None or not user.enabled:
             return _failure()
         return AuthenticatorResult(FlowStatus.CHALLENGE, page="password")
 
     def action(self, context, form: Mapping[str, str]):
-        user = _validated_user(context)
-        if user is None:
+        user = context.user
+        if user is None or not user.enabled:
             return _failure()
         password = form.get("password-new", "")
         policy = context.realm.password_policy

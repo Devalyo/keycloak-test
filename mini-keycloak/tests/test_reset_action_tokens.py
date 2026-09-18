@@ -355,22 +355,13 @@ def test_authenticator_competing_delivery_rejects_stale_session(reset):
 
 
 @pytest.mark.parametrize("stage", ["email", "password"])
-@pytest.mark.parametrize("validation", ["absent", "unconsumed", "different_session", "disabled"])
-def test_authenticator_actions_require_validated_session_user(reset, authenticators, stage, validation):
-    from mini_keycloak.reset_credentials.authenticators import ACTION_TOKEN_USER_ID
+@pytest.mark.parametrize("account", ["unavailable", "disabled"])
+def test_authenticator_actions_reject_unavailable_selected_user(reset, authenticators, stage, account):
     _, _, user, auth, executions = reset
-    authenticators.process_flow()
-    authenticators.process_action(executions[0].id, {"username": user.username})
-    if validation != "absent":
-        auth.auth_notes[ACTION_TOKEN_USER_ID] = user.id
-    if validation in {"different_session", "disabled"}:
-        message = db.session.scalar(select(ResetEmail))
-        service().consume(reset[0].name, message.action_token)
-        if validation == "different_session":
-            other = AuthenticationRepository(db.session).create_session(reset[0], reset[1], auth.redirect_uri, executions[0].id)
-            message.authentication_session_id = other.tab_id
-        else:
-            user.enabled = False
+    if account == "unavailable":
+        auth.selected_user_id = None
+    else:
+        user.enabled = False
     from mini_keycloak.authentication import AuthenticatorContext, FlowStatus
     from mini_keycloak.reset_credentials.authenticators import ResetCredentialEmail, ResetPassword
     index = 1 if stage == "email" else 2
@@ -381,16 +372,26 @@ def test_authenticator_actions_require_validated_session_user(reset, authenticat
     assert IdentityRepository(db.session).password_matches(user, "OriginalPassw0rd!")
 
 
-def test_authenticator_email_action_completes_for_validated_user(reset, authenticators):
-    from mini_keycloak.reset_credentials.authenticators import ACTION_TOKEN_USER_ID
-    realm, _, user, auth, executions = reset
+def test_authenticator_email_action_verifies_selected_enabled_user(reset, authenticators):
+    _, _, user, auth, executions = reset
     authenticators.process_flow()
     authenticators.process_action(executions[0].id, {"username": user.username})
-    service().consume(realm.name, db.session.scalar(select(ResetEmail)).action_token)
-    auth.auth_notes[ACTION_TOKEN_USER_ID] = user.id
     outcome = authenticators.process_action(executions[1].id, {})
     assert outcome.page == "password"
     assert auth.execution_status[executions[1].id] == "SUCCESS"
+    assert user.email_verified
+
+
+def test_authenticator_password_operations_follow_email_completion(reset, authenticators):
+    _, _, user, auth, executions = reset
+    authenticators.process_flow()
+    authenticators.process_action(executions[0].id, {"username": user.username})
+    outcome = authenticators.process_action(executions[1].id, {})
+    assert outcome.page == "password" and outcome.execution_id == executions[2].id
+    outcome = authenticators.process_action(executions[2].id, {
+        "password-new": "ChangedPassw0rd!", "password-confirm": "ChangedPassw0rd!"})
+    assert outcome.complete and auth.execution_status[executions[2].id] == "SUCCESS"
+    assert IdentityRepository(db.session).password_matches(user, "ChangedPassw0rd!")
 
 
 @pytest.mark.parametrize("password,confirmation,policy", [

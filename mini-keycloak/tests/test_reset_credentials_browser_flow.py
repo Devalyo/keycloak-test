@@ -140,6 +140,47 @@ def test_selector_reentry_tracks_current_execution_and_one_delivery(app, client)
         assert raw not in response.text
 
 
+def test_reset_pending_email_execution_completes_authorization(app, client):
+    authorization = client.get(AUTH, query_string=PARAMS)
+    tab_id = query_value(form_action(authorization.text, 'login-actions/authenticate'), 'tab_id')
+    entry = client.get(RESET, query_string={'client_id': 'demo-app', 'tab_id': tab_id})
+    account_action = form_action(entry.text, 'login-actions/reset-credentials')
+
+    selector = client.post(account_action, data={'tryAnotherWay': ''})
+    selector_action = form_action(selector.text, 'login-actions/reset-credentials')
+    delivery = client.post(selector_action, data={'username': 'demo-user'})
+    assert delivery.status_code == 200
+
+    revisit = client.get(RESET, query_string={'client_id': 'demo-app', 'tab_id': tab_id})
+    pending_action = form_action(revisit.text, 'login-actions/reset-credentials')
+    password = client.post(pending_action, data={})
+    assert password.status_code == 200
+    password_action = form_action(password.text, 'login-actions/required-action')
+
+    completion = client.post(password_action, data={
+        'password-new': 'NewPassw0rd!', 'password-confirm': 'NewPassw0rd!'})
+    assert completion.status_code == 302
+    query = parse_qs(urlsplit(completion.location).query)
+    assert query['state'] == [PARAMS['state']]
+    assert 'mini_keycloak_session=' in completion.headers['Set-Cookie']
+    with app.app_context():
+        auth = db.session.get(AuthenticationSession, tab_id)
+        user = db.session.get(User, auth.selected_user_id)
+        code = db.session.scalar(select(AuthorizationCode))
+        session = db.session.scalar(select(UserSession))
+        assert user.email_verified
+        assert IdentityRepository(db.session).password_matches(user, 'NewPassw0rd!')
+        assert code.user_id == session.user_id == user.id
+        assert db.session.scalar(select(func.count()).select_from(ResetEmail)) == 1
+        assert db.session.scalar(select(func.count()).select_from(SecurityEvent).where(
+            SecurityEvent.event_type == 'SEND_RESET_PASSWORD')) == 1
+    exchange = client.post('/realms/demo/protocol/openid-connect/token', data={
+        'grant_type': 'authorization_code', 'client_id': 'demo-app',
+        'code': query['code'][0], 'redirect_uri': PARAMS['redirect_uri'], 'code_verifier': VERIFIER})
+    assert exchange.status_code == 200
+    assert exchange.json['access_token']
+
+
 def test_action_token_continues_same_session_and_clears_selector(app, client):
     tab_id, raw = send_reset(app, client, selector=True)
     response = client.get(CONTINUE, query_string={'key': raw})
