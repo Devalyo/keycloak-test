@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from datetime import timedelta
 import hashlib
 import secrets
@@ -52,6 +53,25 @@ class AuthenticationRepository:
                 AuthenticationSession.expires_at > utc_now(),
             )
         )
+
+    def update_session(
+        self,
+        auth_session: AuthenticationSession,
+        *,
+        current_execution: str | None = None,
+        execution_status: Mapping[str, str] | None = None,
+        auth_notes: Mapping[str, str | None] | None = None,
+    ) -> None:
+        """Stage a versioned transition in the caller's transaction."""
+        if current_execution is not None:
+            auth_session.current_execution = current_execution
+        for execution_id, status in (execution_status or {}).items():
+            auth_session.execution_status[execution_id] = status
+        for name, value in (auth_notes or {}).items():
+            if value is None:
+                auth_session.auth_notes.pop(name, None)
+            else:
+                auth_session.auth_notes[name] = value
 
     def queue_reset_email(self, realm: Realm, user: User) -> ResetEmail:
         raw_token = secrets.token_urlsafe(32)
