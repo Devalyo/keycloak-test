@@ -11,12 +11,18 @@ from mini_keycloak.models import AuthenticationSession, AuthorizationCode, UserS
 from mini_keycloak.repositories.authentication import AuthenticationRepository
 from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.repositories.sessions import UserSessionRepository
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 from tests.helpers import form_action, query_value
 from tests.test_browser_authentication import AUTH, PARAMS, begin, login
 
 
 CREDENTIALS = {'username': 'demo-user', 'password': 'DemoPassw0rd!'}
 LOGIN_PATH = '/realms/demo/login-actions/authenticate'
+
+
+def choose_user_execution(session):
+    return next(item.id for item in AuthenticationFlowService(db.session).executions(session.flow_id)
+                if item.authenticator == 'reset-credentials-choose-user')
 
 
 def preauth_cookie(response):
@@ -79,7 +85,7 @@ def test_invalid_browser_binding_rejected_before_credentials(app, client, monkey
     with app.app_context():
         assert db.session.scalar(select(func.count()).select_from(UserSession)) == 0
         session = db.session.get(AuthenticationSession, query_value(action, 'tab_id'))
-        assert session.current_execution == 'choose-user'
+        assert session.current_execution == choose_user_execution(session)
         assert session.selected_user_id is None
 
 
@@ -140,7 +146,7 @@ def test_concurrent_login_completions_commit_one_session_and_rollback_loser(app,
 
     def load_same_version(repository, tab_id):
         session = original_get_session(repository, tab_id)
-        assert session.current_execution == 'choose-user'
+        assert session.current_execution == choose_user_execution(session)
         # Synchronize only the initial request read. Issuance also revalidates
         # expiry after session insertion, while the writer owns the DB lock.
         if id(session) not in synchronized_sessions:
@@ -195,7 +201,8 @@ def test_concurrent_login_completions_commit_one_session_and_rollback_loser(app,
         auth_session = db.session.get(AuthenticationSession, query_value(action, 'tab_id'))
         assert auth_session.current_execution == 'authenticated'
         assert auth_session.selected_user_id == sessions[0].user_id
-        assert auth_session.version == 2
+        # Completion records its note before issuance consumes that note.
+        assert auth_session.version == 3
         codes = db.session.scalars(select(AuthorizationCode)).all()
         assert len(codes) == 1
         assert codes[0].code_hash == hashlib.sha256(query_value(winner.location, 'code').encode()).hexdigest()

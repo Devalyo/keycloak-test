@@ -7,11 +7,18 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from mini_keycloak.extensions import db
+from tests.test_migrations import assert_flow_revision_round_trip
 from .conftest import migrate
 from .support import seed_graph, snapshot
 
 
 pytestmark = pytest.mark.postgres
+
+
+def test_flow_revision_seeds_preserves_translates_and_reverses(postgres_database):
+    application = postgres_database.app()
+    with application.app_context():
+        assert_flow_revision_round_trip(db.engine, migrate)
 
 
 def test_empty_database_round_trip_matches_metadata(postgres_database):
@@ -124,7 +131,7 @@ def test_throttle_revision_preserves_all_other_rows(postgres_app, postgres_datab
             assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
 
 
-@pytest.mark.parametrize("revision, previous", [("0005", "0004"), ("0006", "0005")])
+@pytest.mark.parametrize("revision, previous", [("0005", "0004"), ("0006", "0005"), ("0007", "0006")])
 @pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
 def test_revision_write_failure_rolls_back_ddl_and_data_then_retries(
         postgres_app, postgres_database, revision, previous, direction):

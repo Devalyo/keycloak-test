@@ -55,6 +55,36 @@ def password_action(app, client, *, parameters=None):
     return tab_id, form_action(response.text, 'login-actions/required-action')
 
 
+@pytest.mark.parametrize('allowed', [False, True])
+def test_reset_public_form_contract_and_realm_control(app, client, allowed):
+    with app.app_context():
+        db.session.scalar(select(Realm)).forgot_password_allowed = allowed
+        db.session.commit()
+    authorization = client.get(AUTH, query_string=PARAMS)
+    assert authorization.status_code == 200
+    assert ('Forgot password?' in authorization.text) is allowed
+    tab_id = query_value(form_action(authorization.text, 'login-actions/authenticate'), 'tab_id')
+    response = client.get(RESET, query_string={'client_id': 'demo-app', 'tab_id': tab_id})
+    if not allowed:
+        assert response.status_code == 400
+        assert response.data == client.get(RESET).data
+        with app.app_context():
+            assert db.session.scalar(select(func.count()).select_from(ResetEmail)) == 0
+        return
+    assert response.status_code == 200
+    action = form_action(response.text, 'login-actions/reset-credentials')
+    assert urlsplit(action).path == '/realms/demo/login-actions/reset-credentials'
+    assert set(parse_qs(urlsplit(action).query)) == {'client_id', 'tab_id', 'execution'}
+    assert query_value(action, 'client_id') == 'demo-app'
+    assert query_value(action, 'tab_id') == tab_id
+    assert 'name="username"' in response.text
+    assert 'name="tryAnotherWay"' in response.text
+    selector = client.post(action, data={'tryAnotherWay': ''})
+    assert selector.status_code == 200
+    assert form_action(selector.text, 'login-actions/reset-credentials') == action
+    assert 'name="username"' in selector.text
+
+
 def test_reset_entry_uses_configured_execution_and_preserves_oidc_request(app, client):
     tab_id, action = begin_reset(client)
     with app.app_context():

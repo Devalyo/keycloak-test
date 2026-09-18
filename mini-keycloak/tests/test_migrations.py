@@ -11,9 +11,6 @@ from mini_keycloak.extensions import db
 
 
 def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path):
-    from uuid import UUID
-    from sqlalchemy import MetaData
-
     url = f"sqlite+pysqlite:///{tmp_path / 'flow-migration.sqlite3'}"
     env = {**__import__('os').environ, 'MINI_KEYCLOAK_DATABASE_URL': url}
     project = Path(__file__).parents[1]
@@ -23,8 +20,18 @@ def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path)
                         direction, revision], cwd=project, env=env, check=True,
                        capture_output=True, text=True)
 
-    migrate('upgrade', '0006')
     engine = create_engine(url)
+    try:
+        assert_flow_revision_round_trip(engine, migrate)
+    finally:
+        engine.dispose()
+
+
+def assert_flow_revision_round_trip(engine, migrate):
+    from uuid import UUID
+    from sqlalchemy import MetaData
+
+    migrate('upgrade', '0006')
     original = MetaData()
     original.reflect(engine)
     from datetime import datetime, timezone, timedelta
@@ -75,12 +82,20 @@ def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path)
         realms = connection.execute(select(upgraded.tables['realms'])).mappings().all()
         assert len({row['reset_credentials_flow_id'] for row in realms}) == 2
         for realm in realms:
+            flow = connection.execute(select(upgraded.tables['authentication_flows']).where(
+                upgraded.tables['authentication_flows'].c.id == realm['reset_credentials_flow_id']
+            )).mappings().one()
+            assert str(UUID(flow['id'])) == flow['id']
+            assert flow['realm_id'] == realm['id']
+            assert (flow['alias'], flow['provider_id'], flow['built_in']) == (
+                'reset credentials', 'basic-flow', True)
             executions = connection.execute(select(upgraded.tables['authentication_executions']).where(
                 upgraded.tables['authentication_executions'].c.flow_id == realm['reset_credentials_flow_id']
             ).order_by(upgraded.tables['authentication_executions'].c.priority)).mappings().all()
             assert [row['authenticator'] for row in executions] == [
                 'reset-credentials-choose-user', 'reset-credential-email', 'reset-password']
             assert all(row['requirement'] == 'REQUIRED' for row in executions)
+            assert [row['priority'] for row in executions] == [10, 20, 30]
             assert len({str(UUID(row['id'])) for row in executions}) == 3
             if realm['id'] == 'r1':
                 execution_ids = [row['id'] for row in executions]
@@ -95,6 +110,9 @@ def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path)
                                                   execution_ids[index]: 'CHALLENGED'}
             assert session['version'] == 4
         assert connection.scalar(text("SELECT current_execution FROM authentication_sessions WHERE tab_id='authenticated'")) == 'authenticated'
+        message = connection.execute(select(upgraded.tables['reset_emails'])).mappings().one()
+        assert all(message[key] is None for key in (
+            'client_id', 'authentication_session_id', 'token_id', 'action_token', 'consumed_at'))
     retained = snapshot()
     for name in before.keys() - {'authentication_sessions'}:
         assert retained[name] == before[name]
@@ -106,7 +124,6 @@ def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path)
     migrate('upgrade', 'head')
     with engine.connect() as connection:
         assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
-    engine.dispose()
 
 
 def test_upgrade_and_downgrade_empty_database(tmp_path):

@@ -22,6 +22,9 @@ realm issuer override), never the request Host or forwarded headers.
 | GET | `/protocol/openid-connect/certs` | Public RSA keys, including retained keys |
 | GET | `/protocol/openid-connect/auth` | Browser authorization code flow |
 | POST | `/login-actions/authenticate` | Bound browser login form |
+| GET, POST | `/login-actions/reset-credentials` | Credential reset and authentication selection |
+| GET | `/login-actions/action-token` | Continue a credential reset from delivered instructions |
+| POST | `/login-actions/required-action` | Complete the password update form |
 | POST | `/protocol/openid-connect/token` | Code exchange, refresh, enabled password grants |
 | GET, POST | `/protocol/openid-connect/userinfo` | Claims authorized by an access token |
 | GET, POST | `/protocol/openid-connect/logout` | RP logout; POST also supports legacy refresh logout |

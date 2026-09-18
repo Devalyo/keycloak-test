@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import timedelta
 from threading import Barrier
 
 import pytest
@@ -10,12 +11,14 @@ from sqlalchemy.orm import Session
 
 from mini_keycloak.extensions import db
 from mini_keycloak.import_export.validation import validate_realm_import
-from mini_keycloak.models import (AuthorizationCode, Client, Credential, LoginFailureBucket,
-    Realm, RealmKey, RefreshToken, SecurityEvent, User, UserSession)
+from mini_keycloak.models import (AuthenticationSession, AuthorizationCode, Client, Credential, LoginFailureBucket,
+    Realm, RealmKey, RefreshToken, ResetEmail, SecurityEvent, User, UserSession)
 from mini_keycloak.models.identity import utc_now
 from mini_keycloak.oidc.errors import InvalidGrant, RefreshReuse
 from mini_keycloak.security.login_throttling import LoginThrottle
 from mini_keycloak.services.authorization import AuthorizationService
+from mini_keycloak.services.action_tokens import ResetActionTokenService
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 from mini_keycloak.services.keys import RealmKeyService
 from mini_keycloak.services.realm_import import RealmImportError, RealmImportService
 from mini_keycloak.services.sessions import revoke_session
@@ -29,6 +32,52 @@ pytestmark = pytest.mark.postgres
 def graph(postgres_app, postgres_database):
     with postgres_app.app_context():
         return seed_graph(db.session, postgres_database.master)
+
+
+@pytest.mark.parametrize('rollback', [False, True])
+def test_reset_token_consumption_has_one_winner_and_releases_rolled_back_claim(
+        postgres_app, postgres_database, graph, rollback, caplog):
+    with postgres_app.app_context():
+        engine = db.engine
+        realm = db.session.get(Realm, graph.realm_id)
+        user = db.session.get(User, graph.user_id)
+        flow_service = AuthenticationFlowService(db.session)
+        flow = flow_service.ensure_reset_flow(realm)
+        execution = next(item for item in flow_service.executions(flow.id)
+                         if item.authenticator == 'reset-credentials-choose-user')
+        auth = AuthenticationSession(tab_id='reset-consumption', realm_id=realm.id,
+            client_id=graph.client_id, selected_user_id=user.id, flow_id=flow.id,
+            current_execution=execution.id, redirect_uri='https://app.example.test/callback',
+            expires_at=utc_now() + timedelta(minutes=5))
+        db.session.add(auth)
+        db.session.flush()
+        message = ResetActionTokenService(db.session, secret=postgres_database.secret).issue(auth, user)
+        message_id, raw, realm_name = message.id, message.action_token, realm.name
+        db.session.commit()
+        db.session.remove()
+
+        def consume(session):
+            try:
+                selected_auth, selected_user = ResetActionTokenService(
+                    session, secret=postgres_database.secret).consume(realm_name, raw)
+                assert selected_auth.tab_id == 'reset-consumption'
+                assert selected_user.id == graph.user_id
+                return 'ok'
+            except ValueError as error:
+                assert str(error) == 'Invalid action token'
+                session.rollback()
+                return 'invalid'
+
+        first, second = locked_pair(engine, consume, consume, rollback=rollback)
+        assert first == 'ok' and second == ('ok' if rollback else 'invalid')
+        with Session(engine) as session:
+            stored = session.get(ResetEmail, message_id)
+            assert stored.consumed and stored.consumed_at is not None
+            assert session.scalar(select(func.count()).select_from(ResetEmail).where(
+                ResetEmail.authentication_session_id == 'reset-consumption')) == 1
+            assert consume(session) == 'invalid'
+            assert session.is_active and not session.in_transaction()
+        assert raw not in caplog.text
 
 
 @pytest.mark.parametrize("entity", ["realm", "client"])

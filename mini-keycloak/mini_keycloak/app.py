@@ -66,7 +66,8 @@ def _reset_form(realm: str, session: AuthenticationSession, execution: str, *, a
     username = '<input name="username">' if account else ""
     return _page(
         "Reset credentials",
-        f'<form method="post" action="{action}">{username}<button>Continue</button></form>',
+        f'<form method="post" action="{action}">{username}<button>Continue</button>'
+        '<button name="tryAnotherWay" value="">Try another way</button></form>',
     )
 
 
