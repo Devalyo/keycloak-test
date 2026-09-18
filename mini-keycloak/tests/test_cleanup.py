@@ -11,6 +11,91 @@ from tests.test_token_endpoint import exchange
 from tests.test_client_authentication import TOKEN
 
 
+def assert_cleanup_retains_linked_outbox(application):
+    from mini_keycloak.models import Client, ResetEmail, User
+    from mini_keycloak.services.action_tokens import ResetActionTokenService
+    from mini_keycloak.services.authentication_flows import AuthenticationFlowService
+    from mini_keycloak.services.bootstrap import ensure_demo_realm
+    from mini_keycloak.services.cleanup import cleanup_expired
+    from mini_keycloak.services.sessions import UserSessionService
+    from mini_keycloak.security.login_throttling import LoginThrottle
+
+    with application.app_context():
+        realm = ensure_demo_realm(db.session)
+        client = db.session.scalar(select(Client).where(Client.realm_id == realm.id))
+        user = db.session.scalar(select(User).where(User.realm_id == realm.id))
+        flow = AuthenticationFlowService(db.session).ensure_reset_flow(realm)
+        execution = AuthenticationFlowService(db.session).executions(flow.id)[0]
+        now = utc_now()
+        tokens = ResetActionTokenService(db.session)
+        for index in range(3):
+            auth = AuthenticationSession(tab_id=f'cleanup-reset-{index}', realm_id=realm.id,
+                client_id=client.id, selected_user_id=user.id, flow_id=flow.id,
+                current_execution=execution.id, redirect_uri=client.redirect_uris[0],
+                expires_at=now + timedelta(minutes=5))
+            db.session.add(auth)
+            db.session.flush()
+            message = tokens.issue(auth, user)
+            if index == 0:
+                tokens.consume(realm.name, message.action_token)
+            if index < 2:
+                auth.expires_at = now - timedelta(seconds=1)
+        user_session = UserSessionService(db.session, idle_seconds=300, max_seconds=600).create(
+            realm, client, user)
+        user_session.idle_expires_at = now - timedelta(seconds=1)
+        common = dict(realm_id=realm.id, client_id=client.id, user_id=user.id,
+                      user_session_id=user_session.id)
+        db.session.add(AuthorizationCode(**common, code_hash='a' * 64,
+            redirect_uri=client.redirect_uris[0], scope='openid', expires_at=now + timedelta(minutes=5)))
+        db.session.add(RefreshToken(**common, token_hash='b' * 64, family_id='cleanup-family',
+            scope='openid', expires_at=now + timedelta(minutes=5)))
+        audit = SecurityEvent(**common, event_type='LOGIN')
+        db.session.add(audit)
+        LoginThrottle(db.session, secret=application.secret_key, threshold=5,
+            window_seconds=300, lock_seconds=60).record_failure(
+                realm.id, 'c' * 64, now=now - timedelta(minutes=10))
+        db.session.commit()
+        audit_id = audit.id
+        original = {row.id: dict(row) for row in
+                    db.session.execute(select(ResetEmail.__table__)).mappings()}
+
+        def fail_delete(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith('DELETE FROM AUTHENTICATION_SESSIONS'):
+                raise RuntimeError('cleanup deletion unavailable')
+
+        event.listen(db.engine, 'before_cursor_execute', fail_delete)
+        try:
+            with pytest.raises(RuntimeError, match='cleanup deletion unavailable'):
+                cleanup_expired(db.session, batch_size=1)
+        finally:
+            event.remove(db.engine, 'before_cursor_execute', fail_delete)
+        assert db.session.scalar(select(func.count()).select_from(AuthenticationSession)) == 3
+        for row in db.session.execute(select(ResetEmail.__table__)).mappings():
+            unchanged = dict(row) == original[row.id]
+            assert unchanged
+        assert db.session.scalar(select(func.count()).select_from(UserSession)) == 1
+        counts = cleanup_expired(db.session, batch_size=1)
+        assert counts == dict(authentication_sessions=2, authorization_codes=1, refresh_tokens=1,
+                              user_sessions=1, login_failure_buckets=1)
+        db.session.expire_all()
+        retained = db.session.execute(select(ResetEmail.__table__)).mappings().all()
+        assert len(retained) == 3
+        for row in retained:
+            before = original[row.id]
+            expected_link = 'cleanup-reset-2' if before['authentication_session_id'] == 'cleanup-reset-2' else None
+            assert row['authentication_session_id'] == expected_link
+            unchanged = all(row[key] == value for key, value in before.items()
+                            if key != 'authentication_session_id')
+            assert unchanged
+        assert db.session.get(SecurityEvent, audit_id).user_session_id is None
+        assert list(db.session.scalars(select(AuthenticationSession.tab_id))) == ['cleanup-reset-2']
+        assert all(count == 0 for count in cleanup_expired(db.session, batch_size=1).values())
+
+
+def test_cleanup_retains_consumed_and_pending_outbox_and_continues_batches(app):
+    assert_cleanup_retains_linked_outbox(app)
+
+
 def test_cleanup_batches_expired_dependencies_preserves_live_rows_and_audit(app):
     sessions = []
     for _ in range(3):

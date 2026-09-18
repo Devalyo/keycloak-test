@@ -1,6 +1,6 @@
 from sqlalchemy import delete, or_, select, update
 
-from mini_keycloak.models import AuthenticationSession, AuthorizationCode, LoginFailureBucket, RefreshToken, SecurityEvent, UserSession
+from mini_keycloak.models import AuthenticationSession, AuthorizationCode, LoginFailureBucket, RefreshToken, ResetEmail, SecurityEvent, UserSession
 from mini_keycloak.models.identity import utc_now
 
 
@@ -10,7 +10,7 @@ def cleanup_expired(session, *, batch_size=100):
     A fixed cutoff makes one run deterministic. Children of inactive sessions
     are unusable even if their own expiry is later. Retain revoked sessions
     through their idle/max window for authenticated logout retries. Retain audit
-    rows, unlinking their nullable references only when the session expires.
+    and outbox rows, unlinking their nullable references only when the session expires.
     """
     if not isinstance(batch_size, int) or not 1 <= batch_size <= 1000:
         raise ValueError('batch_size must be between 1 and 1000')
@@ -36,7 +36,10 @@ def cleanup_expired(session, *, batch_size=100):
                     .order_by(primary_key).limit(batch_size)).all()
                 if not identifiers:
                     break
-                if model is RefreshToken:
+                if model is AuthenticationSession:
+                    session.execute(update(ResetEmail).where(ResetEmail.authentication_session_id.in_(identifiers))
+                                    .values(authentication_session_id=None).execution_options(synchronize_session=False))
+                elif model is RefreshToken:
                     session.execute(update(RefreshToken).where(RefreshToken.replaced_by_id.in_(identifiers))
                                     .values(replaced_by_id=None).execution_options(synchronize_session=False))
                 elif model is UserSession:

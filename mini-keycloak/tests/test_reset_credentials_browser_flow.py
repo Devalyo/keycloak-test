@@ -100,6 +100,30 @@ def test_reset_entry_uses_configured_execution_and_preserves_oidc_request(app, c
             assert getattr(auth, field) == PARAMS[field]
 
 
+def test_ordinary_login_after_reset_selection_clears_execution_notes(app, client):
+    authorization = client.get(AUTH, query_string=PARAMS)
+    login_action = form_action(authorization.text, 'login-actions/authenticate')
+    tab_id = query_value(login_action, 'tab_id')
+    reset = client.get(RESET, query_string={'client_id': 'demo-app', 'tab_id': tab_id})
+    action = form_action(reset.text, 'login-actions/reset-credentials')
+    assert client.post(action, data={'tryAnotherWay': ''}).status_code == 200
+    with app.app_context():
+        auth = db.session.get(AuthenticationSession, tab_id)
+        assert auth.auth_notes[CURRENT_AUTHENTICATION_EXECUTION] == query_value(action, 'execution')
+        assert auth.auth_notes[AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED] == 'true'
+        auth.auth_notes['operator'] = 'retained'
+        db.session.commit()
+    response = client.post(login_action, data={'username': 'demo-user', 'password': 'DemoPassw0rd!'})
+    assert response.status_code == 302
+    assert query_value(response.location, 'state') == PARAMS['state']
+    with app.app_context():
+        auth = db.session.get(AuthenticationSession, tab_id)
+        assert auth.current_execution == 'authenticated'
+        assert auth.auth_notes == {'operator': 'retained'}
+        assert db.session.scalar(select(func.count()).select_from(AuthorizationCode)) == 1
+    assert client.post(login_action, data={'username': 'demo-user', 'password': 'DemoPassw0rd!'}).status_code == 400
+
+
 def test_selector_reentry_tracks_current_execution_and_one_delivery(app, client):
     tab_id, raw = send_reset(app, client, selector=True)
     for _ in range(2):
@@ -180,6 +204,8 @@ def test_password_completion_issues_real_session_code_and_login_event(app, clien
         assert code.user_session_id == event.user_session_id == session.id
         assert auth.current_execution == 'authenticated'
         assert AUTHENTICATION_FLOW_COMPLETED not in auth.auth_notes
+        assert CURRENT_AUTHENTICATION_EXECUTION not in auth.auth_notes
+        assert AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED not in auth.auth_notes
         assert ACTION_TOKEN_USER_ID not in auth.auth_notes
         assert IdentityRepository(db.session).password_matches(db.session.get(User, session.user_id), 'NewPassw0rd!')
         assert set(db.session.scalars(select(SecurityEvent.event_type))) == {

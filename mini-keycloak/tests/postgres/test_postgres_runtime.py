@@ -10,10 +10,15 @@ from sqlalchemy.engine import make_url
 from mini_keycloak.extensions import db
 from mini_keycloak.models import RealmKey
 from .support import seed_graph
+from tests.test_cleanup import assert_cleanup_retains_linked_outbox
 
 
 pytestmark = pytest.mark.postgres
 ORIGIN = "https://identity.example.test"
+
+
+def test_cleanup_retains_linked_outbox_and_completes_later_batches(postgres_app):
+    assert_cleanup_retains_linked_outbox(postgres_app)
 
 
 def test_production_readiness_and_liveness_are_read_only_and_secret_safe(

@@ -7,7 +7,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from mini_keycloak.extensions import db
-from tests.test_migrations import assert_flow_revision_round_trip
+from tests.test_migrations import assert_flow_revision_round_trip, assert_legacy_password_session_resumes
 from .conftest import migrate
 from .support import seed_graph, snapshot
 
@@ -15,10 +15,16 @@ from .support import seed_graph, snapshot
 pytestmark = pytest.mark.postgres
 
 
-def test_flow_revision_seeds_preserves_translates_and_reverses(postgres_database):
+@pytest.mark.parametrize('completed_note', [False, True])
+def test_flow_revision_seeds_preserves_translates_and_reverses(postgres_database, completed_note):
     application = postgres_database.app()
     with application.app_context():
-        assert_flow_revision_round_trip(db.engine, migrate)
+        assert_flow_revision_round_trip(db.engine, migrate, completed_note=completed_note)
+
+
+@pytest.mark.parametrize('selected', [False, True])
+def test_upgraded_password_session_resumes_message_and_token_continuation(postgres_database, selected):
+    assert_legacy_password_session_resumes(postgres_database.app(), migrate, selected=selected)
 
 
 def test_empty_database_round_trip_matches_metadata(postgres_database):

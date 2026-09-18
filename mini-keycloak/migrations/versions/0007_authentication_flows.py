@@ -95,6 +95,11 @@ def upgrade():
                 for index, (semantic, _) in enumerate(PROVIDERS):
                     if session["current_execution"] == semantic:
                         notes = dict(session["auth_notes"])
+                        if semantic == "update-password":
+                            # Pending credentials resume through fresh message delivery.
+                            index = 1 if session["selected_user_id"] is not None else 0
+                            notes.pop("auth.selector.screen.rendered", None)
+                            values["password_update_allowed"] = False
                         notes[CURRENT_EXECUTION_NOTE] = execution_ids[index]
                         values.update(current_execution=execution_ids[index], auth_notes=notes,
                             execution_status={**{identifier: "SUCCESS" for identifier in execution_ids[:index]},
@@ -115,7 +120,7 @@ def downgrade():
         for session in connection.execute(sa.select(sessions)).mappings().all():
             notes = dict(session["auth_notes"])
             current = notes.pop(CURRENT_EXECUTION_NOTE, session["current_execution"])
-            semantic = execution_map.get(current)
+            semantic = None if session["current_execution"] == "authenticated" else execution_map.get(current)
             values = {"auth_notes": notes}
             if semantic is not None:
                 values["current_execution"] = semantic

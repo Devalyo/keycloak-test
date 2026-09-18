@@ -10,7 +10,8 @@ from sqlalchemy import create_engine, inspect, select, text
 from mini_keycloak.extensions import db
 
 
-def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path):
+@pytest.mark.parametrize('completed_note', [False, True])
+def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path, completed_note):
     url = f"sqlite+pysqlite:///{tmp_path / 'flow-migration.sqlite3'}"
     env = {**__import__('os').environ, 'MINI_KEYCLOAK_DATABASE_URL': url}
     project = Path(__file__).parents[1]
@@ -22,12 +23,12 @@ def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path)
 
     engine = create_engine(url)
     try:
-        assert_flow_revision_round_trip(engine, migrate)
+        assert_flow_revision_round_trip(engine, migrate, completed_note=completed_note)
     finally:
         engine.dispose()
 
 
-def assert_flow_revision_round_trip(engine, migrate):
+def assert_flow_revision_round_trip(engine, migrate, *, completed_note=False):
     from uuid import UUID
     from sqlalchemy import MetaData
 
@@ -54,6 +55,7 @@ def assert_flow_revision_round_trip(engine, migrate):
             connection.execute(original.tables['authentication_sessions'].insert().values(
                 tab_id=semantic, realm_id='r1', client_id='c', redirect_uri='https://example.test/cb',
                 response_type='code', scope='openid', current_execution=semantic,
+                selected_user_id='u' if semantic in {'email-gate', 'update-password'} else None,
                 auth_notes={'operator': 'retained'}, password_update_allowed=semantic == 'update-password',
                 version=4, created_at=now, expires_at=now + timedelta(minutes=5)))
         connection.execute(original.tables['reset_emails'].insert().values(
@@ -100,14 +102,16 @@ def assert_flow_revision_round_trip(engine, migrate):
             if realm['id'] == 'r1':
                 execution_ids = [row['id'] for row in executions]
         for index, semantic in enumerate(('choose-user', 'email-gate', 'update-password')):
+            target_index = min(index, 1)
             session = connection.execute(select(upgraded.tables['authentication_sessions']).where(
                 upgraded.tables['authentication_sessions'].c.tab_id == semantic)).mappings().one()
             assert session['flow_id'] is not None
-            assert session['current_execution'] == execution_ids[index]
+            assert session['current_execution'] == execution_ids[target_index]
             assert session['auth_notes'] == {'operator': 'retained',
-                'current.authentication.execution': execution_ids[index]}
-            assert session['execution_status'] == {**{identifier: 'SUCCESS' for identifier in execution_ids[:index]},
-                                                  execution_ids[index]: 'CHALLENGED'}
+                'current.authentication.execution': execution_ids[target_index]}
+            assert session['execution_status'] == {**{identifier: 'SUCCESS' for identifier in execution_ids[:target_index]},
+                                                  execution_ids[target_index]: 'CHALLENGED'}
+            assert session['password_update_allowed'] is False
             assert session['version'] == 4
         assert connection.scalar(text("SELECT current_execution FROM authentication_sessions WHERE tab_id='authenticated'")) == 'authenticated'
         message = connection.execute(select(upgraded.tables['reset_emails'])).mappings().one()
@@ -116,14 +120,120 @@ def assert_flow_revision_round_trip(engine, migrate):
     retained = snapshot()
     for name in before.keys() - {'authentication_sessions'}:
         assert retained[name] == before[name]
+    if completed_note:
+        with engine.begin() as connection:
+            connection.execute(upgraded.tables['authentication_sessions'].update().where(
+                upgraded.tables['authentication_sessions'].c.tab_id == 'authenticated').values(
+                    auth_notes={'operator': 'retained', 'current.authentication.execution': execution_ids[0]}))
     migrate('downgrade', '0006')
-    assert snapshot() == before
+    downgraded = snapshot()
+    for name in before.keys() - {'authentication_sessions'}:
+        assert downgraded[name] == before[name]
+    expected_sessions = {row.tab_id: dict(row._mapping) for row in before['authentication_sessions']}
+    # A pending password update needs new delivery after the lifecycle transition.
+    expected_sessions['update-password'].update(current_execution='email-gate', password_update_allowed=False)
+    assert {row.tab_id: dict(row._mapping) for row in downgraded['authentication_sessions']} == expected_sessions
     assert set(inspect(engine).get_table_names()) == set(original.tables)
     for name, table in original.tables.items():
         assert {column['name'] for column in inspect(engine).get_columns(name)} == set(table.c.keys())
     migrate('upgrade', 'head')
     with engine.connect() as connection:
         assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
+
+
+@pytest.mark.parametrize('selected', [False, True])
+def test_upgraded_password_session_resumes_message_and_token_continuation(tmp_path, monkeypatch, selected):
+    from flask_migrate import downgrade, upgrade
+    from mini_keycloak.app import create_app
+
+    monkeypatch.setattr('logging.config.fileConfig', lambda *args, **kwargs: None)
+    application = create_app({'TESTING': True,
+        'SQLALCHEMY_DATABASE_URI': f"sqlite:///{tmp_path / 'resume-migration.sqlite3'}"})
+    migrations = str(Path(__file__).parents[1] / 'migrations')
+
+    def migrate(direction, revision):
+        (upgrade if direction == 'upgrade' else downgrade)(directory=migrations, revision=revision)
+
+    try:
+        assert_legacy_password_session_resumes(application, migrate, selected=selected)
+    finally:
+        with application.app_context():
+            db.session.remove()
+            db.engine.dispose()
+
+
+def assert_legacy_password_session_resumes(application, migrate, *, selected):
+    from datetime import timedelta
+    from mini_keycloak.authentication import AuthenticationProcessor, AuthenticatorRegistry
+    from mini_keycloak.authentication.constants import CURRENT_AUTHENTICATION_EXECUTION
+    from mini_keycloak.models import AuthenticationSession, Client, ResetEmail, User
+    from mini_keycloak.models.identity import utc_now
+    from mini_keycloak.repositories.identity import IdentityRepository
+    from mini_keycloak.reset_credentials.authenticators import (
+        ACTION_TOKEN_USER_ID, ResetCredentialChooseUser, ResetCredentialEmail, ResetPassword,
+    )
+    from mini_keycloak.services.action_tokens import ResetActionTokenService
+    from mini_keycloak.services.authentication_flows import AuthenticationFlowService
+    from mini_keycloak.services.bootstrap import ensure_demo_realm
+
+    with application.app_context():
+        migrate('upgrade', 'head')
+        realm = ensure_demo_realm(db.session)
+        client = db.session.scalar(select(Client).where(Client.realm_id == realm.id))
+        user = db.session.scalar(select(User).where(User.realm_id == realm.id))
+        oidc = dict(redirect_uri=client.redirect_uris[0], response_type='code', scope='openid',
+                    state='retained-state', nonce='retained-nonce')
+        auth = AuthenticationSession(tab_id='retained-password', realm_id=realm.id,
+            client_id=client.id, selected_user_id=user.id if selected else None,
+            current_execution='update-password', password_update_allowed=True,
+            auth_notes={'operator': 'retained', 'auth.selector.screen.rendered': 'true'},
+            expires_at=utc_now() + timedelta(minutes=5), **oidc)
+        db.session.add(auth)
+        db.session.add(ResetEmail(realm_id=realm.id, user_id=user.id, recipient=user.email,
+            action_token_hash='d' * 64, consumed=True, expires_at=utc_now() + timedelta(minutes=5)))
+        db.session.commit()
+        db.session.remove()
+        migrate('downgrade', '0006')
+        with db.engine.connect() as connection:
+            assert connection.scalar(text("SELECT current_execution FROM authentication_sessions")) == 'update-password'
+        migrate('upgrade', 'head')
+        auth = db.session.get(AuthenticationSession, 'retained-password')
+        executions = {item.authenticator: item.id for item in
+                      AuthenticationFlowService(db.session).executions(auth.flow_id)}
+        processor = AuthenticationProcessor(db.session, realm_name='demo', client_id='demo-app',
+            tab_id=auth.tab_id, registry=AuthenticatorRegistry({
+                'reset-credentials-choose-user': ResetCredentialChooseUser(),
+                'reset-credential-email': ResetCredentialEmail(), 'reset-password': ResetPassword(),
+            }))
+        outcome = processor.process_flow()
+        if not selected:
+            assert outcome.page == 'account'
+            outcome = processor.process_action(outcome.execution_id, {'username': 'demo-user'})
+        assert outcome.page == 'login'
+        assert outcome.execution_id == executions['reset-credential-email']
+        assert auth.execution_status == {
+            executions['reset-credentials-choose-user']: 'SUCCESS', executions['reset-credential-email']: 'FORK'}
+        assert ACTION_TOKEN_USER_ID not in auth.auth_notes
+        assert not auth.password_update_allowed
+        for name, value in oidc.items():
+            assert getattr(auth, name) == value
+        assert auth.auth_notes['operator'] == 'retained'
+        db.session.commit()
+        historical = db.session.scalar(select(ResetEmail).where(ResetEmail.authentication_session_id.is_(None)))
+        assert historical.consumed and historical.action_token is None
+        message = db.session.scalar(select(ResetEmail).where(ResetEmail.authentication_session_id == auth.tab_id))
+        assert message is not None and not message.consumed
+        continued, user = ResetActionTokenService(db.session).consume('demo', message.action_token)
+        assert continued.tab_id == auth.tab_id and user.id == auth.selected_user_id
+        auth.auth_notes[ACTION_TOKEN_USER_ID] = user.id
+        outcome = processor.process_flow()
+        assert outcome.page == 'password' and outcome.execution_id == executions['reset-password']
+        assert auth.auth_notes[CURRENT_AUTHENTICATION_EXECUTION] == outcome.execution_id
+        assert processor.process_action(outcome.execution_id, {
+            'password-new': 'Replacement-password-456!', 'password-confirm': 'Replacement-password-456!'}).complete
+        db.session.commit()
+        assert IdentityRepository(db.session).password_matches(user, 'Replacement-password-456!')
+        assert set(auth.execution_status.values()) == {'SUCCESS'}
 
 
 def test_upgrade_and_downgrade_empty_database(tmp_path):

@@ -7,7 +7,10 @@ import secrets
 
 from sqlalchemy.orm import Session
 
-from mini_keycloak.authentication.constants import AUTHENTICATION_FLOW_COMPLETED
+from mini_keycloak.authentication.constants import (
+    AUTHENTICATION_FLOW_COMPLETED, AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED,
+    CURRENT_AUTHENTICATION_EXECUTION,
+)
 from mini_keycloak.models import AuthorizationCode, Client, UserSession
 from mini_keycloak.models.identity import utc_now
 from mini_keycloak.repositories.protocol import AuthorizationCodeRepository
@@ -37,6 +40,8 @@ class AuthorizationService:
         auth.selected_user_id = user_session.user_id
         auth.current_execution = 'authenticated'
         auth.auth_notes.pop(AUTHENTICATION_FLOW_COMPLETED, None)
+        auth.auth_notes.pop(CURRENT_AUTHENTICATION_EXECUTION, None)
+        auth.auth_notes.pop(AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED, None)
         raw = secrets.token_urlsafe(32)
         self.repository.add(AuthorizationCode(
             code_hash=hashlib.sha256(raw.encode()).hexdigest(),
