@@ -1,18 +1,32 @@
 import pytest
 from flask import request
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.exc import StaleDataError
 
 from mini_keycloak.extensions import db
-from mini_keycloak.models import AuthenticationSession
-from mini_keycloak.reset_credentials.flow import (
-    AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED,
-    CHOOSE_USER_EXECUTION,
-    EMAIL_GATE_EXECUTION,
-    ResetFlow,
+from mini_keycloak.models import AuthenticationSession, ResetEmail
+from mini_keycloak.authentication import AuthenticationProcessor, AuthenticatorRegistry
+from mini_keycloak.authentication.constants import (
+    AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED, RESET_CREDENTIALS_CHOOSE_USER,
+    RESET_CREDENTIAL_EMAIL, RESET_PASSWORD,
 )
+from mini_keycloak.reset_credentials.authenticators import (
+    ACTION_TOKEN_USER_ID, ResetCredentialChooseUser, ResetCredentialEmail, ResetPassword,
+)
+from mini_keycloak.services.action_tokens import ResetActionTokenService
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 from mini_keycloak.services.bootstrap import ensure_demo_realm
 from mini_keycloak.store import PersistentStore
+
+
+def _processor(session, tab_id):
+    return AuthenticationProcessor(session, realm_name='demo', client_id='demo-app',
+        tab_id=tab_id, registry=AuthenticatorRegistry({
+            RESET_CREDENTIALS_CHOOSE_USER: ResetCredentialChooseUser(),
+            RESET_CREDENTIAL_EMAIL: ResetCredentialEmail(),
+            RESET_PASSWORD: ResetPassword(),
+        }))
 
 
 def _create_authentication_session(*, advance_to_password: bool = False):
@@ -21,12 +35,16 @@ def _create_authentication_session(*, advance_to_password: bool = False):
     store = PersistentStore(db.session)
     client = store.get_client(realm.id, "demo-app")
     assert client is not None
-    flow = ResetFlow(store)
-    auth_session = flow.create_session(realm, client, client.redirect_uris[0])
+    executions = AuthenticationFlowService(db.session).executions(realm.reset_credentials_flow_id)
+    auth_session = store.create_auth_session(realm, client, client.redirect_uris[0], executions[0].id)
+    auth_session.flow_id = realm.reset_credentials_flow_id
     if advance_to_password:
-        flow.show_selector(auth_session)
-        flow.submit_identifier(auth_session, "demo-user")
-        flow.submit_email_gate(auth_session)
+        processor = _processor(db.session, auth_session.tab_id)
+        processor.process_action(executions[0].id, {'username': 'demo-user'})
+        message = db.session.scalar(select(ResetEmail))
+        _, user = ResetActionTokenService(db.session).consume('demo', message.action_token)
+        auth_session.auth_notes[ACTION_TOKEN_USER_ID] = user.id
+        assert processor.process_flow().page == 'password'
     db.session.commit()
     return auth_session.tab_id, realm.id, auth_session.selected_user_id
 
@@ -42,20 +60,21 @@ def test_concurrent_authentication_session_transition_rejects_stale_writer(db_ap
             loser = loser_session.get(AuthenticationSession, tab_id)
             assert winner is not None
             assert loser is not None
-            assert winner.version == loser.version == 1
+            version, execution = winner.version, winner.current_execution
+            assert winner.version == loser.version
 
             winner.auth_notes["winner"] = "true"
             winner_session.commit()
 
-            loser.current_execution = EMAIL_GATE_EXECUTION
+            loser.auth_notes['loser'] = 'true'
             with pytest.raises(StaleDataError):
                 loser_session.commit()
             loser_session.rollback()
 
         persisted = db.session.get(AuthenticationSession, tab_id)
         assert persisted is not None
-        assert persisted.version == 2
-        assert persisted.current_execution == CHOOSE_USER_EXECUTION
+        assert persisted.version == version + 1
+        assert persisted.current_execution == execution
         assert persisted.auth_notes == {"winner": "true"}
 
 
@@ -73,14 +92,16 @@ def test_concurrent_password_update_loser_cannot_overwrite_winner(db_app):
             loser_auth = loser_session.get(AuthenticationSession, tab_id)
             assert winner_auth is not None
             assert loser_auth is not None
-            winner_flow = ResetFlow(PersistentStore(winner_session))
-            loser_flow = ResetFlow(PersistentStore(loser_session))
+            winner_flow = _processor(winner_session, tab_id)
+            loser_flow = _processor(loser_session, tab_id)
 
-            winner_flow.update_password(winner_auth, "WinnerPassw0rd!")
+            winner_flow.process_action(winner_auth.current_execution,
+                {'password-new': 'WinnerPassw0rd!', 'password-confirm': 'WinnerPassw0rd!'})
             winner_session.commit()
 
-            loser_flow.update_password(loser_auth, "LoserPassw0rd!")
             with pytest.raises(StaleDataError):
+                loser_flow.process_action(loser_auth.current_execution,
+                    {'password-new': 'LoserPassw0rd!', 'password-confirm': 'LoserPassw0rd!'})
                 loser_session.commit()
             loser_session.rollback()
 
@@ -94,6 +115,7 @@ def test_concurrent_password_update_loser_cannot_overwrite_winner(db_app):
 def test_http_flow_returns_400_and_rolls_back_stale_transition(db_app):
     with db_app.app_context():
         tab_id, _, _ = _create_authentication_session()
+        execution = db.session.get(AuthenticationSession, tab_id).current_execution
     raced = False
     held_request_rows = []
 
@@ -123,7 +145,7 @@ def test_http_flow_returns_400_and_rolls_back_stale_transition(db_app):
         query_string={
             "client_id": "demo-app",
             "tab_id": tab_id,
-            "execution": CHOOSE_USER_EXECUTION,
+            "execution": execution,
         },
         data={"tryAnotherWay": ""},
     )
@@ -132,6 +154,6 @@ def test_http_flow_returns_400_and_rolls_back_stale_transition(db_app):
     with db_app.app_context():
         persisted = db.session.get(AuthenticationSession, tab_id)
         assert persisted is not None
-        assert persisted.current_execution == CHOOSE_USER_EXECUTION
+        assert persisted.current_execution == execution
         assert persisted.auth_notes == {"competing": "true"}
         assert AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED not in persisted.auth_notes

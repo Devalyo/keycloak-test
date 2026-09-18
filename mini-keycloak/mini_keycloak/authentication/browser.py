@@ -12,6 +12,7 @@ from werkzeug.datastructures import MultiDict
 from werkzeug.exceptions import HTTPException
 
 from mini_keycloak.extensions import db
+from mini_keycloak.authentication.constants import AUTHENTICATION_FLOW_COMPLETED
 from mini_keycloak.models import AuthenticationSession
 from mini_keycloak.models.identity import utc_now
 from mini_keycloak.oidc.authorization import authorization_error, authorization_redirect
@@ -21,6 +22,7 @@ from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.services.sessions import BrowserAuthenticationResult, UserSessionService
 from mini_keycloak.services.tokens import realm_issuer
 from mini_keycloak.services.authorization import AuthorizationService
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 from mini_keycloak.services.events import request_event, request_failure
 from mini_keycloak.security.logging import log_failure
 from mini_keycloak.security.login_throttling import CredentialFailure, LoginThrottle
@@ -130,7 +132,7 @@ def canonical_origin(value, *, allow_path=False):
 
 
 def complete_authentication(result: BrowserAuthenticationResult):
-    """Commit the ordinary login and its authorization code together."""
+    """Commit browser authentication and its authorization code together."""
     code = AuthorizationService(db.session,
         lifetime_seconds=current_app.config['AUTHORIZATION_CODE_LIFETIME_SECONDS']).issue(result)
     request_event(db.session, result.authentication_session.realm_id, 'LOGIN',
@@ -153,17 +155,22 @@ def complete_authentication(result: BrowserAuthenticationResult):
 @browser.get('/realms/<realm>/protocol/openid-connect/auth')
 def authorize(realm):
     enabled_realm, client = validate_authorization(realm, request.args)
-    # Keep the established reset entry execution; normal login consumes this
-    # transaction independently and never changes reset-flow transitions.
+    flows = AuthenticationFlowService(db.session)
+    flow = flows.ensure_reset_flow(enabled_realm)
+    executions = flows.executions(flow.id)
+    if not executions:
+        raise InvalidRequest()
     session = AuthenticationSession(
         tab_id=secrets.token_urlsafe(18), realm_id=enabled_realm.id, client_id=client.id,
-        current_execution='choose-user', expires_at=utc_now() + timedelta(minutes=30),
+        flow_id=flow.id, current_execution=executions[0].id, execution_status={},
+        expires_at=utc_now() + timedelta(minutes=30),
         **{name: request.args.get(name) for name in OIDC_FIELDS})
     db.session.add(session)
     db.session.flush()
     sid = browser_sid()
     user_session = session_service().reuse(sid, enabled_realm) if sid else None
     if user_session is not None:
+        session.auth_notes[AUTHENTICATION_FLOW_COMPLETED] = 'true'
         return complete_authentication(BrowserAuthenticationResult(session, user_session))
     db.session.commit()
     response = make_response(login_page(realm, session))
@@ -182,7 +189,8 @@ def authenticate(realm):
     if (session is None or session.realm.name != realm
             or session.client.realm_id != session.realm_id
             or session.client.client_id != request.args.get('client_id')
-            or session.current_execution != 'choose-user'):
+            or session.current_execution == 'authenticated'
+            or any(status == 'SUCCESS' for status in session.execution_status.values())):
         abort(400)
     # Browser hints add defense in depth to the mandatory pre-auth cookie.
     # Only trusted realm/configuration state selects the accepted origin.
@@ -214,6 +222,7 @@ def authenticate(realm):
     try:
         throttle.clear(enabled_realm.id, bucket_hash)
         user_session = session_service().create(enabled_realm, client, user)
+        session.auth_notes[AUTHENTICATION_FLOW_COMPLETED] = 'true'
         return complete_authentication(BrowserAuthenticationResult(session, user_session))
     except StaleDataError:
         db.session.rollback()

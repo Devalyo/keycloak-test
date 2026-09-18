@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from mini_keycloak.extensions import db
+from mini_keycloak.authentication.constants import AUTHENTICATION_FLOW_COMPLETED
 from mini_keycloak.models import AuthenticationSession, AuthorizationCode, Client, UserSession
 from mini_keycloak.models.identity import utc_now
 from tests.helpers import form_action
@@ -283,7 +284,8 @@ def test_issuer_rejects_ineligible_authentication_handoff(app, client, mutation)
     other_browser.get(AUTH, query_string=PARAMS)
     with app.app_context():
         auth = db.session.scalar(select(AuthenticationSession).where(
-            AuthenticationSession.current_execution == 'choose-user'))
+            AuthenticationSession.current_execution != 'authenticated'))
+        auth.auth_notes[AUTHENTICATION_FLOW_COMPLETED] = 'true'
         user_session = db.session.scalar(select(UserSession))
         if mutation == 'revoked':
             user_session.revoked_at = utc_now()

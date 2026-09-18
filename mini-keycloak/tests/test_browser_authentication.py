@@ -71,6 +71,9 @@ def test_authorization_persists_oidc_parameters_and_escaped_template(app, client
     assert 'login-actions/reset-credentials?' in response.text
     with app.app_context():
         session = db.session.get(AuthenticationSession, query_value(action, 'tab_id'))
+        assert session.flow_id == session.realm.reset_credentials_flow_id
+        assert session.flow_id is not None
+        assert session.execution_status == {}
         for name in ('redirect_uri', 'response_type', 'scope', 'state', 'nonce', 'code_challenge', 'code_challenge_method'):
             assert getattr(session, name) == PARAMS[name]
 

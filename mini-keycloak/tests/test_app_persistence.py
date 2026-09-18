@@ -2,7 +2,7 @@ import pytest
 from flask import current_app
 
 from mini_keycloak.extensions import db
-from mini_keycloak.flow import CHOOSE_USER_EXECUTION
+from mini_keycloak.authentication.constants import CURRENT_AUTHENTICATION_EXECUTION
 from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.services.bootstrap import ensure_demo_realm
 from mini_keycloak.services.keys import RealmKeyService
@@ -258,5 +258,5 @@ def test_disabled_client_rejects_existing_session_without_selector_mutation(db_a
     with db_app.app_context():
         session = db_app.extensions["mini_keycloak_store"].get_auth_session(tab_id)
         assert session is not None
-        assert session.current_execution == CHOOSE_USER_EXECUTION
-        assert session.auth_notes == {}
+        assert session.current_execution == query_value(selector_action, 'execution')
+        assert session.auth_notes == {CURRENT_AUTHENTICATION_EXECUTION: session.current_execution}

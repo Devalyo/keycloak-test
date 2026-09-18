@@ -7,6 +7,7 @@ import secrets
 
 from sqlalchemy.orm import Session
 
+from mini_keycloak.authentication.constants import AUTHENTICATION_FLOW_COMPLETED
 from mini_keycloak.models import AuthorizationCode, Client, UserSession
 from mini_keycloak.models.identity import utc_now
 from mini_keycloak.repositories.protocol import AuthorizationCodeRepository
@@ -27,12 +28,15 @@ class AuthorizationService:
     def issue(self, result: BrowserAuthenticationResult) -> str:
         auth, user_session = result.authentication_session, result.user_session
         now = utc_now()
-        if (auth.current_execution != 'choose-user'
+        if (auth.auth_notes.get(AUTHENTICATION_FLOW_COMPLETED) != 'true'
+                or auth.current_execution == 'authenticated'
+                or auth.selected_user_id not in (None, user_session.user_id)
                 or AuthenticationRepository(self.session).get_session(auth.tab_id) is None
                 or UserSessionRepository(self.session).eligible(user_session.sid, auth.realm_id, now) is None):
             raise AccessDenied()
         auth.selected_user_id = user_session.user_id
         auth.current_execution = 'authenticated'
+        auth.auth_notes.pop(AUTHENTICATION_FLOW_COMPLETED, None)
         raw = secrets.token_urlsafe(32)
         self.repository.add(AuthorizationCode(
             code_hash=hashlib.sha256(raw.encode()).hexdigest(),
