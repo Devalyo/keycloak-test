@@ -14,6 +14,7 @@ from mini_keycloak.services.events import request_event
 
 ATTEMPTED_USERNAME = "attempted.username"
 ACTION_TOKEN_USER_ID = "action.token.user.id"
+RESET_EMAIL_DELIVERY = "reset.email.delivery"
 RESET_MESSAGE = "If the account exists, reset instructions have been sent."
 
 
@@ -55,7 +56,8 @@ class ResetCredentialChooseUser:
         auth.selected_user_id = user.id if user is not None else None
         auth.password_update_allowed = False
         context.repository.update_session(auth, auth_notes={
-            ATTEMPTED_USERNAME: identifier[:320], ACTION_TOKEN_USER_ID: None})
+            ATTEMPTED_USERNAME: identifier[:320], ACTION_TOKEN_USER_ID: None,
+            RESET_EMAIL_DELIVERY: None})
         return AuthenticatorResult(FlowStatus.SUCCESS)
 
 
@@ -68,9 +70,13 @@ class ResetCredentialEmail:
             return AuthenticatorResult(FlowStatus.SUCCESS)
         user = context.user
         if user is not None and user.enabled and user.email:
-            tokens = self.action_tokens or ResetActionTokenService(context.repository.session)
-            tokens.issue(context.authentication_session, user)
-            _event(context, user, "SEND_RESET_PASSWORD")
+            auth = context.authentication_session
+            delivery = f"{context.execution.id}:{user.id}"
+            if auth.auth_notes.get(RESET_EMAIL_DELIVERY) != delivery:
+                context.repository.update_session(auth, auth_notes={RESET_EMAIL_DELIVERY: delivery})
+                tokens = self.action_tokens or ResetActionTokenService(context.repository.session)
+                tokens.issue(auth, user)
+                _event(context, user, "SEND_RESET_PASSWORD")
         return AuthenticatorResult(FlowStatus.FORK, page="login", message=RESET_MESSAGE)
 
     def action(self, context, form: Mapping[str, str]):

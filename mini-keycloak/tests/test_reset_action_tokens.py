@@ -274,6 +274,86 @@ def test_authenticator_consumed_token_continuation_challenges_password(reset, au
     assert db.session.scalar(select(func.count(ResetEmail.id))) == 1
 
 
+@pytest.mark.parametrize("revisit", ["flow", "account_submission"])
+def test_authenticator_pending_delivery_is_reused_on_revisit(reset, authenticators, revisit):
+    from mini_keycloak.models import SecurityEvent
+    from mini_keycloak.reset_credentials.authenticators import ACTION_TOKEN_USER_ID
+    realm, _, user, auth, executions = reset
+    authenticators.process_flow()
+    initial = authenticators.process_action(executions[0].id, {"username": user.username})
+    message = db.session.scalar(select(ResetEmail))
+    message_id, raw = message.id, message.action_token
+    db.session.commit()
+    for _ in range(3):
+        db.session.expire_all()
+        outcome = (authenticators.process_flow() if revisit == "flow" else
+                   authenticators.process_action(executions[0].id, {"username": user.username}))
+        assert outcome == initial
+        db.session.commit()
+    messages = list(db.session.scalars(select(ResetEmail)))
+    assert len(messages) == 1 and messages[0].id == message_id
+    assert db.session.scalar(select(func.count(SecurityEvent.id)).where(
+        SecurityEvent.event_type == "SEND_RESET_PASSWORD")) == 1
+    service().consume(realm.name, raw)
+    auth.auth_notes[ACTION_TOKEN_USER_ID] = user.id
+    outcome = authenticators.process_flow()
+    assert outcome.page == "password" and outcome.execution_id == executions[2].id
+    assert db.session.scalar(select(func.count(ResetEmail.id))) == 1
+
+
+def test_authenticator_delivery_marker_rolls_back_with_message(reset, authenticators):
+    from mini_keycloak.models import SecurityEvent
+    _, _, user, auth, executions = reset
+    authenticators.process_flow()
+    db.session.commit()
+    original_notes = dict(auth.auth_notes)
+    authenticators.process_action(executions[0].id, {"username": user.username})
+    db.session.rollback()
+    assert auth.auth_notes == original_notes
+    assert db.session.scalar(select(func.count(ResetEmail.id))) == 0
+    assert db.session.scalar(select(func.count(SecurityEvent.id))) == 0
+    authenticators.process_action(executions[0].id, {"username": user.username})
+    authenticators.process_flow()
+    assert db.session.scalar(select(func.count(ResetEmail.id))) == 1
+    assert db.session.scalar(select(func.count(SecurityEvent.id))) == 1
+
+
+def test_authenticator_new_account_selection_starts_new_delivery(reset, authenticators):
+    from mini_keycloak.models import SecurityEvent
+    _, _, user, auth, executions = reset
+    authenticators.process_flow()
+    authenticators.process_action(executions[0].id, {"username": user.username})
+    db.session.commit()
+    auth.execution_status.clear()
+    authenticators.process_flow()
+    authenticators.process_action(executions[0].id, {"username": user.username})
+    authenticators.process_flow()
+    assert db.session.scalar(select(func.count(ResetEmail.id))) == 2
+    assert db.session.scalar(select(func.count(SecurityEvent.id))) == 2
+
+
+def test_authenticator_competing_delivery_rejects_stale_session(reset):
+    from sqlalchemy.orm.exc import StaleDataError
+    from mini_keycloak.authentication import AuthenticatorContext
+    from mini_keycloak.models import AuthenticationExecution, Client, Realm, SecurityEvent
+    from mini_keycloak.reset_credentials.authenticators import ResetCredentialEmail
+    realm, client, _, auth, executions = reset
+    factory = sessionmaker(bind=db.engine, expire_on_commit=False)
+    with factory() as winner, factory() as loser:
+        contexts = [AuthenticatorContext(AuthenticationRepository(session),
+            session.get(AuthenticationSession, auth.tab_id), session.get(Realm, realm.id),
+            session.get(Client, client.id), session.get(AuthenticationExecution, executions[1].id))
+            for session in (winner, loser)]
+        ResetCredentialEmail(service(winner)).authenticate(contexts[0])
+        winner.commit()
+        with pytest.raises(StaleDataError):
+            ResetCredentialEmail(service(loser)).authenticate(contexts[1])
+            loser.commit()
+        loser.rollback()
+    assert db.session.scalar(select(func.count(ResetEmail.id))) == 1
+    assert db.session.scalar(select(func.count(SecurityEvent.id))) == 1
+
+
 @pytest.mark.parametrize("stage", ["email", "password"])
 @pytest.mark.parametrize("validation", ["absent", "unconsumed", "different_session", "disabled"])
 def test_authenticator_actions_require_validated_session_user(reset, authenticators, stage, validation):
