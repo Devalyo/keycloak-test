@@ -203,7 +203,7 @@ def test_fresh_compose_tls_oidc_persistence_and_secret_safe_logs(stack):
         "compiler=any(shutil.which(x) for x in ['cc','gcc','clang']), "
         "source=any(pathlib.Path(x).exists() for x in ['/app/tests','/app/mini_keycloak','/build','/wheels']), "
         "cache=pathlib.Path('/root/.cache/pip').exists())))")
-    assert json.loads(runtime) == dict(uid=10001, fixture=True, migrations=6,
+    assert json.loads(runtime) == dict(uid=10001, fixture=True, migrations=7,
                                       compiler=False, source=False, cache=False)
     stack.compose('exec', '-T', 'web', 'python', '-m', 'pip', 'check')
     for health in ('/health', '/health/', '/health/live', '/health/ready'):

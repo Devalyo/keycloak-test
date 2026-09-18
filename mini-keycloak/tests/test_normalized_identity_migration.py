@@ -52,7 +52,7 @@ def snapshot(engine):
     metadata.reflect(bind=engine)
     with engine.connect() as connection:
         return {table.name: [dict(row) for row in connection.execute(sa.select(table).order_by(*table.primary_key.columns)).mappings()]
-                for table in metadata.sorted_tables}
+                for table in metadata.tables.values()}
 
 
 def schema_snapshot(engine):
@@ -66,6 +66,8 @@ def schema_snapshot(engine):
 def test_0005_backfills_casefold_preserves_all_rows_and_round_trips(tmp_path, foreign_keys):
     with legacy_database(tmp_path, foreign_keys) as engine:
         original = snapshot(engine)
+        original_columns = {table: {column["name"] for column in sa.inspect(engine).get_columns(table)}
+                            for table in original}
         upgrade(directory=str(MIGRATIONS), revision="head")
         inspector = sa.inspect(engine)
         for table, column in (("realms", "name_normalized"), ("clients", "client_id_normalized")):
@@ -84,7 +86,7 @@ def test_0005_backfills_casefold_preserves_all_rows_and_round_trips(tmp_path, fo
         for table, rows in original.items():
             if table == "alembic_version":
                 continue
-            assert [{key: value for key, value in row.items() if key not in {"name_normalized", "client_id_normalized"}}
+            assert [{key: value for key, value in row.items() if key in original_columns[table]}
                     for row in current[table]] == rows
         # Constraint enforcement is exercised on the migrated database, not only create_all.
         for statement in (

@@ -11,10 +11,59 @@ from mini_keycloak.oidc.errors import InvalidClient
 from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.services.clients import ClientService
 from mini_keycloak.services.realm_import import RealmAlreadyExists, RealmImportService
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
+from mini_keycloak.models import AuthenticationFlow, AuthenticationExecution
+from mini_keycloak.repositories.authentication import AuthenticationRepository
 
 
 PASSWORD = "Import-password-783!"
 SECRET = "Import-client-secret-931!"
+
+
+def test_reset_flow_provisioning_is_ordered_opaque_and_idempotent(db_app):
+    from uuid import UUID
+
+    with db_app.app_context():
+        realm = IdentityRepository(db.session).create_realm("configured", display_name="Operator name")
+        service = AuthenticationFlowService(db.session)
+        flow = service.ensure_reset_flow(realm)
+        db.session.commit()
+        executions = service.executions(flow.id)
+        assert realm.reset_credentials_flow_id == flow.id
+        assert flow.realm_id == realm.id and flow.built_in
+        assert [row.authenticator for row in executions] == [
+            "reset-credentials-choose-user", "reset-credential-email", "reset-password"]
+        assert [row.requirement for row in executions] == ["REQUIRED"] * 3
+        assert len({row.priority for row in executions}) == 3
+        assert [row.priority for row in executions] == sorted(row.priority for row in executions)
+        assert len({str(UUID(row.id)) for row in executions}) == 3
+        before = snapshot()
+        assert service.ensure_reset_flow(realm).id == flow.id
+        db.session.commit()
+        assert snapshot() == before
+        repository = AuthenticationRepository(db.session)
+        assert repository.get_flow(realm.id, flow.id) is flow
+        assert repository.get_flow("other-realm", flow.id) is None
+        assert repository.get_execution(realm.id, executions[0].id) is executions[0]
+        assert repository.get_execution("other-realm", executions[0].id) is None
+
+
+def test_import_preserves_operator_flow_binding_and_executions(db_app):
+    with db_app.app_context():
+        realm = apply(db_app, document())
+        assert realm.reset_credentials_flow_id is not None
+        custom = AuthenticationFlow(realm_id=realm.id, alias="operator", provider_id="basic-flow", built_in=False)
+        db.session.add(custom)
+        db.session.flush()
+        realm.reset_credentials_flow_id = custom.id
+        db.session.add(AuthenticationExecution(flow_id=custom.id, authenticator="reset-password",
+                                               requirement="REQUIRED", priority=7))
+        db.session.commit()
+        before = snapshot()
+        apply(db_app, {"realm": "Imported"}, update=True)
+        db.session.commit()
+        assert realm.reset_credentials_flow_id == custom.id
+        assert snapshot() == before
 
 
 def document(name="Imported"):

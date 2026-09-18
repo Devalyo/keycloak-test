@@ -9,6 +9,7 @@ from mini_keycloak.import_export.validation import validate_realm_import
 from mini_keycloak.models import Realm
 from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.services.realm_import import RealmImportService
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 
 
 def ensure_demo_realm(session: Session) -> Realm:
@@ -31,4 +32,5 @@ def ensure_demo_realm(session: Session) -> Realm:
                   if client.client_id_normalized == "demo-app")
     client.pkce_policy = "optional"
     realm.password_grant_enabled = True
+    AuthenticationFlowService(session).ensure_reset_flow(realm)
     return realm

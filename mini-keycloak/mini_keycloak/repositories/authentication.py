@@ -5,13 +5,26 @@ import secrets
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from mini_keycloak.models import AuthenticationSession, Client, Realm, ResetEmail, User
+from mini_keycloak.models import AuthenticationExecution, AuthenticationFlow, AuthenticationSession, Client, Realm, ResetEmail, User
 from mini_keycloak.models.identity import utc_now
 
 
 class AuthenticationRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    def get_flow(self, realm_id: str, flow_id: str) -> AuthenticationFlow | None:
+        return self.session.scalar(select(AuthenticationFlow).where(
+            AuthenticationFlow.realm_id == realm_id, AuthenticationFlow.id == flow_id))
+
+    def get_execution(self, realm_id: str, execution_id: str) -> AuthenticationExecution | None:
+        return self.session.scalar(select(AuthenticationExecution).join(AuthenticationFlow).where(
+            AuthenticationFlow.realm_id == realm_id, AuthenticationExecution.id == execution_id))
+
+    def executions(self, flow_id: str) -> tuple[AuthenticationExecution, ...]:
+        return tuple(self.session.scalars(select(AuthenticationExecution).where(
+            AuthenticationExecution.flow_id == flow_id).order_by(
+                AuthenticationExecution.priority, AuthenticationExecution.id)))
 
     def create_session(
         self,

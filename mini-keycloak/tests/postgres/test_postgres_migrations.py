@@ -25,7 +25,7 @@ def test_empty_database_round_trip_matches_metadata(postgres_database):
             else:
                 assert tables == set(db.metadata.tables) | {"alembic_version"}
                 with db.engine.connect() as connection:
-                    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0006"
+                    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
                     assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
                 # Alembic comparison covers columns/types/FKs/unique constraints
                 # and indexes; primary-key column changes need an explicit check.
@@ -35,20 +35,32 @@ def test_empty_database_round_trip_matches_metadata(postgres_database):
 
 
 def test_normalized_backfill_preserves_populated_graph_and_round_trips(postgres_app, postgres_database):
+    import hashlib
+    import json
+    from sqlalchemy import MetaData, select
+
     with postgres_app.app_context():
         seed_graph(db.session, postgres_database.master)
         db.session.remove()
         migrate("downgrade", "0004")
         original = snapshot(db.engine)
+        legacy = MetaData()
+        legacy.reflect(bind=db.engine)
         assert all(count for count, digest in original.values()), "Every legacy table must contain rows"
         migrate("upgrade", "head")
         with db.engine.connect() as connection:
             assert connection.execute(text("SELECT name, name_normalized FROM realms")).one() == ("  Straße  ", "strasse")
             assert connection.execute(text("SELECT client_id, client_id_normalized FROM clients")).one() == ("  Straße-ﬃ  ", "strasse-ffi")
             assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
-        current = snapshot(db.engine, omit_tables={"alembic_version", "login_failure_buckets"},
-                           omit_columns={"name_normalized", "client_id_normalized"})
-        assert current == {table: value for table, value in original.items() if table != "alembic_version"}
+        # Compare each historical table through its historical column set;
+        # later revisions add flow/outbox metadata without replacing its rows.
+        with db.engine.connect() as connection:
+            for name, table in legacy.tables.items():
+                if name == "alembic_version":
+                    continue
+                rows = connection.execute(select(table).order_by(*table.primary_key.columns)).all()
+                payload = json.dumps([list(row) for row in rows], default=str, sort_keys=True)
+                assert (len(rows), hashlib.sha256(payload.encode()).hexdigest()) == original[name]
         for table, column in (("realms", "name_normalized"), ("clients", "client_id_normalized")):
             reflected = {item["name"]: item for item in inspect(db.engine).get_columns(table)}
             assert reflected[column]["nullable"] is False
@@ -97,15 +109,17 @@ def test_throttle_revision_preserves_all_other_rows(postgres_app, postgres_datab
     with postgres_app.app_context():
         seed_graph(db.session, postgres_database.master)
         db.session.remove()
+        migrate("downgrade", "0006")
         original = snapshot(db.engine)
         assert all(count for count, digest in original.values()), "Every table must contain retained data"
-        migrate("upgrade", "head")
+        migrate("upgrade", "0006")
         assert snapshot(db.engine) == original
         retained = {table: value for table, value in original.items()
                     if table not in {"alembic_version", "login_failure_buckets"}}
-        for direction, revision in (("downgrade", "0005"), ("upgrade", "0006"), ("downgrade", "0005"), ("upgrade", "head")):
+        for direction, revision in (("downgrade", "0005"), ("upgrade", "0006"), ("downgrade", "0005"), ("upgrade", "0006")):
             migrate(direction, revision)
             assert snapshot(db.engine, omit_tables={"alembic_version", "login_failure_buckets"}) == retained
+        migrate("upgrade", "head")
         with db.engine.connect() as connection:
             assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
 

@@ -21,12 +21,25 @@ from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.services.bootstrap import ensure_demo_realm
 from mini_keycloak.services.clients import ClientService
 from mini_keycloak.services.realm_import import RealmImportService
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 
 
 def snapshot():
     return {table.name: sorted((tuple(repr(value) for value in row)
                                for row in db.session.execute(select(table))), key=repr)
             for table in db.metadata.sorted_tables}
+
+
+def test_bootstrap_provisions_reset_flow_once(app):
+    with app.app_context():
+        realm = IdentityRepository(db.session).get_realm("demo")
+        service = AuthenticationFlowService(db.session)
+        assert realm.reset_credentials_flow_id is not None
+        assert len(service.executions(realm.reset_credentials_flow_id)) == 3
+        before = snapshot()
+        ensure_demo_realm(db.session)
+        db.session.commit()
+        assert snapshot() == before
 
 
 def test_packaged_fixture_imports_the_bundled_identity_contract(db_app, tmp_path, monkeypatch):

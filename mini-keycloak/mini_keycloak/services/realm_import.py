@@ -7,6 +7,7 @@ from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.security.password_policy import password_satisfies_policy
 from mini_keycloak.services.clients import ClientService
 from mini_keycloak.services.keys import RealmKeyService
+from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 
 
 REALM_FIELDS = {
@@ -96,6 +97,7 @@ class RealmImportService:
                 self._apply_user(realm, user, users.get(user.username_normalized),
                                  preserve_existing_credentials)
             self.keys.ensure_active_key(realm.id)
+            AuthenticationFlowService(self.session).ensure_reset_flow(realm)
             self.session.flush()
             return realm
         except (RealmImportError, RealmImportValidationError) as exc:

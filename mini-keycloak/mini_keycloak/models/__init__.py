@@ -1,4 +1,6 @@
 from mini_keycloak.models.authentication import (
+    AuthenticationFlow,
+    AuthenticationExecution,
     AuthenticationSession,
     AuthorizationCode,
     LoginFailureBucket,
@@ -10,6 +12,8 @@ from mini_keycloak.models.authentication import (
 from mini_keycloak.models.identity import Client, Credential, Realm, RealmKey, User
 
 __all__ = [
+    "AuthenticationFlow",
+    "AuthenticationExecution",
     "AuthenticationSession",
     "AuthorizationCode",
     "LoginFailureBucket",

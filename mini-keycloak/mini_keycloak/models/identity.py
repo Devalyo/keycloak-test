@@ -50,6 +50,10 @@ class Realm(db.Model):
     display_name: Mapped[str | None] = mapped_column(String(255))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     forgot_password_allowed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    reset_credentials_flow_id: Mapped[str | None] = mapped_column(
+        ForeignKey("authentication_flows.id", name="fk_realms_reset_credentials_flow_id", use_alter=True,
+                   ondelete="SET NULL")
+    )
     password_grant_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     password_policy: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     issuer_override: Mapped[str | None] = mapped_column(Text)

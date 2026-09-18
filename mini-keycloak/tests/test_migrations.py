@@ -10,6 +10,105 @@ from sqlalchemy import create_engine, inspect, select, text
 from mini_keycloak.extensions import db
 
 
+def test_flow_revision_preserves_rows_translates_sessions_and_reverses(tmp_path):
+    from uuid import UUID
+    from sqlalchemy import MetaData
+
+    url = f"sqlite+pysqlite:///{tmp_path / 'flow-migration.sqlite3'}"
+    env = {**__import__('os').environ, 'MINI_KEYCLOAK_DATABASE_URL': url}
+    project = Path(__file__).parents[1]
+
+    def migrate(direction, revision):
+        subprocess.run([sys.executable, '-m', 'flask', '--app', 'mini_keycloak.app', 'db',
+                        direction, revision], cwd=project, env=env, check=True,
+                       capture_output=True, text=True)
+
+    migrate('upgrade', '0006')
+    engine = create_engine(url)
+    original = MetaData()
+    original.reflect(engine)
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        for realm_id in ('r1', 'r2'):
+            connection.execute(original.tables['realms'].insert().values(
+                id=realm_id, name=realm_id, name_normalized=realm_id, enabled=True,
+                forgot_password_allowed=True, password_grant_enabled=False,
+                password_policy={'operator': 'retained'}, created_at=now))
+        connection.execute(original.tables['clients'].insert().values(
+            id='c', realm_id='r1', client_id='browser', client_id_normalized='browser', enabled=True,
+            public_client=True, redirect_uris=[], web_origins=[], standard_flow_enabled=True,
+            direct_access_grants_enabled=False, pkce_policy='S256', default_scopes=[], optional_scopes=[],
+            post_logout_redirect_uris=[]))
+        connection.execute(original.tables['users'].insert().values(
+            id='u', realm_id='r1', username='retained', username_normalized='retained',
+            enabled=True, email_verified=False, created_at=now))
+        for semantic in ('choose-user', 'email-gate', 'update-password', 'authenticated'):
+            connection.execute(original.tables['authentication_sessions'].insert().values(
+                tab_id=semantic, realm_id='r1', client_id='c', redirect_uri='https://example.test/cb',
+                response_type='code', scope='openid', current_execution=semantic,
+                auth_notes={'operator': 'retained'}, password_update_allowed=semantic == 'update-password',
+                version=4, created_at=now, expires_at=now + timedelta(minutes=5)))
+        connection.execute(original.tables['reset_emails'].insert().values(
+            id='message', realm_id='r1', user_id='u', recipient='retained@example.test',
+            action_token_hash='a' * 64, consumed=True, created_at=now,
+            expires_at=now + timedelta(minutes=5)))
+
+    def snapshot():
+        with engine.connect() as connection:
+            return {name: connection.execute(select(table).order_by(*table.primary_key)).all()
+                    for name, table in original.tables.items() if name != 'alembic_version'}
+
+    before = snapshot()
+    migrate('upgrade', 'head')
+    inspector = inspect(engine)
+    assert {'authentication_flows', 'authentication_executions'} <= set(inspector.get_table_names())
+    assert {'client_id', 'authentication_session_id', 'token_id', 'action_token', 'consumed_at'} <= {
+        column['name'] for column in inspector.get_columns('reset_emails')}
+    assert {'flow_id', 'execution_status'} <= {
+        column['name'] for column in inspector.get_columns('authentication_sessions')}
+    upgraded = MetaData()
+    upgraded.reflect(engine)
+    with engine.connect() as connection:
+        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0007'
+        assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
+        realms = connection.execute(select(upgraded.tables['realms'])).mappings().all()
+        assert len({row['reset_credentials_flow_id'] for row in realms}) == 2
+        for realm in realms:
+            executions = connection.execute(select(upgraded.tables['authentication_executions']).where(
+                upgraded.tables['authentication_executions'].c.flow_id == realm['reset_credentials_flow_id']
+            ).order_by(upgraded.tables['authentication_executions'].c.priority)).mappings().all()
+            assert [row['authenticator'] for row in executions] == [
+                'reset-credentials-choose-user', 'reset-credential-email', 'reset-password']
+            assert all(row['requirement'] == 'REQUIRED' for row in executions)
+            assert len({str(UUID(row['id'])) for row in executions}) == 3
+            if realm['id'] == 'r1':
+                execution_ids = [row['id'] for row in executions]
+        for index, semantic in enumerate(('choose-user', 'email-gate', 'update-password')):
+            session = connection.execute(select(upgraded.tables['authentication_sessions']).where(
+                upgraded.tables['authentication_sessions'].c.tab_id == semantic)).mappings().one()
+            assert session['flow_id'] is not None
+            assert session['current_execution'] == execution_ids[index]
+            assert session['auth_notes'] == {'operator': 'retained',
+                'current.authentication.execution': execution_ids[index]}
+            assert session['execution_status'] == {**{identifier: 'SUCCESS' for identifier in execution_ids[:index]},
+                                                  execution_ids[index]: 'CHALLENGED'}
+            assert session['version'] == 4
+        assert connection.scalar(text("SELECT current_execution FROM authentication_sessions WHERE tab_id='authenticated'")) == 'authenticated'
+    retained = snapshot()
+    for name in before.keys() - {'authentication_sessions'}:
+        assert retained[name] == before[name]
+    migrate('downgrade', '0006')
+    assert snapshot() == before
+    assert set(inspect(engine).get_table_names()) == set(original.tables)
+    for name, table in original.tables.items():
+        assert {column['name'] for column in inspect(engine).get_columns(name)} == set(table.c.keys())
+    migrate('upgrade', 'head')
+    with engine.connect() as connection:
+        assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
+    engine.dispose()
+
+
 def test_upgrade_and_downgrade_empty_database(tmp_path):
     database = tmp_path / "migration.sqlite3"
     env = {
@@ -80,7 +179,7 @@ def test_oidc_revision_preserves_existing_identity_and_downgrades_to_0001(tmp_pa
         connection.execute(text("INSERT INTO clients (id, realm_id, client_id, enabled, public_client, redirect_uris, web_origins, standard_flow_enabled, direct_access_grants_enabled) VALUES ('c', 'r', 'existing-client', 1, 1, '[]', '[]', 1, 0)"))
     migrate("upgrade", "head")
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0006"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
         assert connection.scalar(text("SELECT password_grant_enabled FROM realms")) == 0
         assert connection.execute(text("SELECT name, enabled, forgot_password_allowed FROM realms")).one() == ("existing", 1, 1)
         assert connection.execute(text("SELECT client_id, direct_access_grants_enabled, pkce_policy FROM clients")).one() == ("existing-client", 0, "S256")
@@ -116,12 +215,14 @@ def test_throttle_revision_write_failure_rolls_back_schema_and_retries(tmp_path,
         'SQLALCHEMY_DATABASE_URI': f"sqlite:///{tmp_path / 'throttle-rollback.sqlite3'}"})
     migrations = str(Path(__file__).parents[1] / 'migrations')
     with application.app_context():
-        upgrade(directory=migrations, revision='0005' if direction == 'upgrade' else '0006')
+        upgrade(directory=migrations, revision='head')
         ensure_demo_realm(db.session)
         if direction == 'downgrade':
             realm_id = db.session.scalar(select(Realm.id))
             LoginThrottle.from_config(db.session, application.config).record_failure(realm_id, 'a' * 64, now=utc_now())
         db.session.commit()
+        db.session.remove()
+        downgrade(directory=migrations, revision='0005' if direction == 'upgrade' else '0006')
         with db.engine.begin() as connection:
             connection.exec_driver_sql("""CREATE TRIGGER reject_throttle_revision
                 BEFORE UPDATE ON alembic_version
@@ -158,7 +259,7 @@ def test_throttle_revision_preserves_all_existing_tables_and_rows(tmp_path):
         subprocess.run([sys.executable, '-m', 'flask', '--app', 'mini_keycloak.app', 'db',
                         direction, revision], cwd=project, env=env, check=True, capture_output=True)
 
-    migrate('upgrade', '0005')
+    migrate('upgrade', 'head')
     application = create_app({'TESTING': True, 'SQLALCHEMY_DATABASE_URI': url})
     with application.app_context():
         ensure_demo_realm(db.session)
@@ -180,6 +281,8 @@ def test_throttle_revision_preserves_all_existing_tables_and_rows(tmp_path):
         db.session.add(ResetEmail(realm_id=realm.id, user_id=user.id, recipient='test@example.test',
             action_token_hash='a' * 64, expires_at=utc_now() + timedelta(minutes=5)))
         db.session.commit()
+        db.session.remove()
+        migrate('downgrade', '0005')
         # 0006 may only create its own table, without rewriting retained state.
         def snapshot():
             with db.engine.connect() as connection:
@@ -188,15 +291,13 @@ def test_throttle_revision_preserves_all_existing_tables_and_rows(tmp_path):
                     if table not in {'alembic_version', 'login_failure_buckets'}}
         before = snapshot()
         assert all(before.values()), 'Every pre-existing table must contain retained data'
-        migrate('upgrade', 'head')
+        migrate('upgrade', '0006')
         assert 'login_failure_buckets' in inspect(db.engine).get_table_names()
         assert snapshot() == before
-        with db.engine.connect() as connection:
-            assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
         migrate('downgrade', '0005')
         assert 'login_failure_buckets' not in inspect(db.engine).get_table_names()
         assert snapshot() == before
-        migrate('upgrade', 'head')
+        migrate('upgrade', '0006')
         assert snapshot() == before
 
 
