@@ -1,9 +1,9 @@
 from collections.abc import Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 import hashlib
 import secrets
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from mini_keycloak.models import AuthenticationExecution, AuthenticationFlow, AuthenticationSession, Client, Realm, ResetEmail, User
@@ -88,3 +88,21 @@ class AuthenticationRepository:
 
     def outbox_count(self) -> int:
         return self.session.scalar(select(func.count(ResetEmail.id))) or 0
+
+    def get_reset_email(self, token_id: str) -> ResetEmail | None:
+        return self.session.scalar(select(ResetEmail).where(ResetEmail.token_id == token_id))
+
+    def consume_reset_email(self, message: ResetEmail, now: datetime) -> ResetEmail | None:
+        return self.session.scalar(update(ResetEmail).where(
+            ResetEmail.id == message.id,
+            ResetEmail.realm_id == message.realm_id,
+            ResetEmail.client_id == message.client_id,
+            ResetEmail.user_id == message.user_id,
+            ResetEmail.authentication_session_id == message.authentication_session_id,
+            ResetEmail.token_id == message.token_id,
+            ResetEmail.action_token_hash == message.action_token_hash,
+            ResetEmail.consumed_at.is_(None),
+            ResetEmail.consumed.is_(False),
+            ResetEmail.expires_at > now,
+        ).values(consumed_at=now, consumed=True).returning(ResetEmail)
+            .execution_options(populate_existing=True, synchronize_session=False))

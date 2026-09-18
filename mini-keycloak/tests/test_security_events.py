@@ -139,3 +139,31 @@ def test_reuse_still_revokes_session_if_audit_write_fails(app, client, monkeypat
         assert db.session.scalar(select(UserSession)).revoked_at is not None
         assert all(row.revoked_at is not None for row in db.session.scalars(select(RefreshToken)))
     assert 'event-storage-private-secret' not in caplog.text + response.text
+
+
+@pytest.mark.parametrize('event_type', ['SEND_RESET_PASSWORD', 'UPDATE_PASSWORD', 'UPDATE_CREDENTIAL'])
+def test_reset_events_project_persisted_identity_and_session_only(app, event_type):
+    from mini_keycloak.repositories.authentication import AuthenticationRepository
+    from mini_keycloak.repositories.identity import IdentityRepository
+    from mini_keycloak.services.events import EventService
+    with app.app_context():
+        identities = IdentityRepository(db.session)
+        realm = identities.get_realm('demo')
+        client = identities.get_client(realm.id, 'demo-app')
+        user = identities.find_user(realm.id, 'demo-user')
+        auth = AuthenticationRepository(db.session).create_session(realm, client, client.redirect_uris[0], 'account')
+        auth.selected_user_id = user.id
+        event = EventService(db.session).record(realm.id, event_type, client_id=client.id,
+            user_id=user.id, authentication_session_id=auth.tab_id,
+            details={'code_id': 'request-value', 'username': 'request-value', 'email': 'request-value'})
+        assert event.details == {'code_id': auth.tab_id, 'username': user.username, 'email': user.email}
+        with pytest.raises(ValueError):
+            EventService(db.session).record(realm.id, event_type, client_id=client.id,
+                user_id=user.id, authentication_session_id='missing')
+        other = identities.create_user(realm.id, 'other', 'other@example.test', 'ExamplePassw0rd!')
+        with pytest.raises(ValueError):
+            EventService(db.session).record(realm.id, event_type, client_id=client.id,
+                user_id=other.id, authentication_session_id=auth.tab_id)
+        ordinary = EventService(db.session).record(realm.id, 'LOGIN', client_id=client.id,
+            user_id=user.id, details={'code_id': 'request-value', 'username': 'request-value', 'email': 'request-value'})
+        assert ordinary.details == {}
