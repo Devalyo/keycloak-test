@@ -6,7 +6,7 @@ from mini_keycloak.authentication.constants import CURRENT_AUTHENTICATION_EXECUT
 from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.services.bootstrap import ensure_demo_realm
 from mini_keycloak.services.keys import RealmKeyService
-from tests.helpers import form_action, query_value
+from tests.helpers import form_action, link_href, query_value
 
 
 def _create_dynamic_identity(repository, realm_name="configured"):
@@ -237,10 +237,7 @@ def test_disabled_client_rejects_existing_session_without_selector_mutation(db_a
     tab_id = query_value(
         form_action(authorization.text, "login-actions/authenticate"), "tab_id"
     )
-    reset = client.get(
-        "/realms/demo/login-actions/reset-credentials",
-        query_string={"client_id": "demo-app", "tab_id": tab_id},
-    )
+    reset = client.get(link_href(authorization.text, "login-actions/reset-credentials"))
     selector_action = form_action(reset.text, "login-actions/reset-credentials")
 
     with db_app.app_context():

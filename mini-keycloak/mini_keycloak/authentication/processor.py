@@ -5,7 +5,13 @@ from collections.abc import Mapping
 from sqlalchemy.orm import Session
 
 from mini_keycloak.authentication.constants import CURRENT_AUTHENTICATION_EXECUTION
-from mini_keycloak.authentication.engine import AuthenticatorRegistry, DefaultAuthenticationFlow, FlowOutcome
+from mini_keycloak.authentication.engine import (
+    AuthenticationFlowContext,
+    Authenticator,
+    AuthenticatorRegistry,
+    DefaultAuthenticationFlow,
+    FlowOutcome,
+)
 from mini_keycloak.models import AuthenticationSession, Client, Realm, User
 from mini_keycloak.repositories.authentication import AuthenticationRepository
 from mini_keycloak.repositories.identity import IdentityRepository
@@ -13,13 +19,14 @@ from mini_keycloak.repositories.identity import IdentityRepository
 
 class AuthenticationProcessor:
     def __init__(self, session: Session, *, realm_name: str, client_id: str,
-                 tab_id: str, registry: AuthenticatorRegistry) -> None:
+                 tab_id: str, registry: AuthenticatorRegistry, forms=None) -> None:
         self.repository = AuthenticationRepository(session)
         self.identities = IdentityRepository(session)
         self.realm_name = realm_name
         self.client_id = client_id
         self.tab_id = tab_id
         self.registry = registry
+        self.forms = forms
 
     @property
     def authentication_session(self) -> AuthenticationSession:
@@ -59,12 +66,51 @@ class AuthenticationProcessor:
         if ((current is not None and current not in execution_ids)
                 or any(execution_id not in execution_ids for execution_id in requested_executions)):
             raise ValueError("Invalid authentication request")
-        return DefaultAuthenticationFlow(self.repository, auth, realm, client, executions, self.registry)
+        return DefaultAuthenticationFlow(
+            self.repository,
+            auth,
+            executions,
+            self.registry,
+            self.create_authenticator_context,
+        )
+
+    def create_authenticator_context(
+        self,
+        execution,
+        authenticator: Authenticator,
+        executions,
+        forms=None,
+    ) -> AuthenticationFlowContext:
+        if not any(item.id == execution.id for item in executions):
+            raise ValueError("Invalid authentication request")
+        auth = self.authentication_session
+        realm = self.repository.session.get(Realm, auth.realm_id)
+        client = self.repository.session.get(Client, auth.client_id)
+        if realm is None or client is None:
+            raise ValueError("Invalid authentication request")
+        self._validate_user(auth)
+        form_provider = forms if forms is not None else self.forms
+        if form_provider is not None:
+            form_provider = form_provider.for_execution(execution.id)
+        return AuthenticationFlowContext(
+            self.repository,
+            auth,
+            realm,
+            client,
+            execution,
+            authenticator,
+            form_provider,
+        )
 
     def process_flow(self) -> FlowOutcome:
         return self._flow().process_flow()
 
     def process_action(self, execution_id: str, form: Mapping[str, str]) -> FlowOutcome:
+        if (
+            self.authentication_session.auth_notes.get(CURRENT_AUTHENTICATION_EXECUTION)
+            != execution_id
+        ):
+            raise ValueError("Invalid authentication request")
         requested = (execution_id,)
         if "authenticationExecution" in form:
             requested += (form["authenticationExecution"],)

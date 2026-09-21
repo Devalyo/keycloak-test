@@ -1,6 +1,7 @@
 """Signed, single-use reset messages within the caller's transaction."""
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 import hashlib
 import hmac
 import secrets
@@ -16,6 +17,13 @@ from mini_keycloak.repositories.identity import IdentityRepository
 
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+@dataclass(frozen=True)
+class ConsumedActionToken:
+    token_type: str
+    authentication_session: AuthenticationSession
+    user: User
 
 
 class ResetActionTokenService:
@@ -62,7 +70,7 @@ class ResetActionTokenService:
         self.session.flush()
         return message
 
-    def consume(self, realm_name: str, raw_token: str) -> tuple[AuthenticationSession, User]:
+    def consume(self, realm_name: str, raw_token: str) -> ConsumedActionToken:
         if not isinstance(raw_token, str):
             raise ValueError("Invalid action token")
         try:
@@ -73,7 +81,7 @@ class ResetActionTokenService:
             if (set(claims) != strings | {"iat", "exp"}
                     or any(type(claims[key]) is not str or not claims[key] for key in strings)
                     or type(claims["iat"]) is not int or type(claims["exp"]) is not int
-                    or claims["typ"] != "reset-credentials" or claims["iat"] >= claims["exp"]):
+                    or claims["iat"] >= claims["exp"]):
                 raise ValueError("Invalid action token")
         except (jwt.PyJWTError, TypeError, ValueError):
             raise ValueError("Invalid action token") from None
@@ -98,4 +106,4 @@ class ResetActionTokenService:
             raise ValueError("Invalid action token")
         if self.repository.consume_reset_email(message, utc_now()) is None:
             raise ValueError("Invalid action token")
-        return auth, user
+        return ConsumedActionToken(claims["typ"], auth, user)

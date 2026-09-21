@@ -8,6 +8,8 @@ from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, inspect, select, text
 
 from mini_keycloak.extensions import db
+from mini_keycloak.authentication.providers import ClassProviderFactory
+from mini_keycloak.authentication.forms import LoginFormsProvider
 
 
 @pytest.mark.parametrize('completed_note', [False, True])
@@ -74,12 +76,15 @@ def assert_flow_revision_round_trip(engine, migrate, *, completed_note=False):
     assert {'authentication_flows', 'authentication_executions'} <= set(inspector.get_table_names())
     assert {'client_id', 'authentication_session_id', 'token_id', 'action_token', 'consumed_at'} <= {
         column['name'] for column in inspector.get_columns('reset_emails')}
-    assert {'flow_id', 'execution_status'} <= {
+    assert {
+        'flow_id', 'execution_status', 'session_code_hash',
+        'browser_binding_generation', 'required_actions', 'current_required_action',
+    } <= {
         column['name'] for column in inspector.get_columns('authentication_sessions')}
     upgraded = MetaData()
     upgraded.reflect(engine)
     with engine.connect() as connection:
-        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0007'
+        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0008'
         assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
         realms = connection.execute(select(upgraded.tables['realms'])).mappings().all()
         assert len({row['reset_credentials_flow_id'] for row in realms}) == 2
@@ -112,6 +117,10 @@ def assert_flow_revision_round_trip(engine, migrate, *, completed_note=False):
             assert session['execution_status'] == {**{identifier: 'SUCCESS' for identifier in execution_ids[:target_index]},
                                                   execution_ids[target_index]: 'CHALLENGED'}
             assert session['password_update_allowed'] is False
+            assert len(session['session_code_hash']) == 64
+            assert session['browser_binding_generation'] == 0
+            assert session['required_actions'] == []
+            assert session['current_required_action'] is None
             assert session['version'] == 4
         assert connection.scalar(text("SELECT current_execution FROM authentication_sessions WHERE tab_id='authenticated'")) == 'authenticated'
         message = connection.execute(select(upgraded.tables['reset_emails'])).mappings().one()
@@ -164,14 +173,18 @@ def test_upgraded_password_session_resumes_message_and_token_continuation(tmp_pa
 
 def assert_legacy_password_session_resumes(application, migrate, *, selected):
     from datetime import timedelta
-    from mini_keycloak.authentication import AuthenticationProcessor, AuthenticatorRegistry
-    from mini_keycloak.authentication.constants import CURRENT_AUTHENTICATION_EXECUTION
+    from mini_keycloak.authentication import (
+        AuthenticationManager, AuthenticationProcessor, AuthenticatorRegistry,
+        RequiredActionRegistry,
+    )
     from mini_keycloak.models import AuthenticationSession, Client, ResetEmail, User
     from mini_keycloak.models.identity import utc_now
+    from mini_keycloak.repositories.authentication import AuthenticationRepository
     from mini_keycloak.repositories.identity import IdentityRepository
     from mini_keycloak.reset_credentials.authenticators import (
         ACTION_TOKEN_USER_ID, ResetCredentialChooseUser, ResetCredentialEmail, ResetPassword,
     )
+    from mini_keycloak.reset_credentials.update_password import UPDATE_PASSWORD, UpdatePassword
     from mini_keycloak.services.action_tokens import ResetActionTokenService
     from mini_keycloak.services.authentication_flows import AuthenticationFlowService
     from mini_keycloak.services.bootstrap import ensure_demo_realm
@@ -202,14 +215,15 @@ def assert_legacy_password_session_resumes(application, migrate, *, selected):
                       AuthenticationFlowService(db.session).executions(auth.flow_id)}
         processor = AuthenticationProcessor(db.session, realm_name='demo', client_id='demo-app',
             tab_id=auth.tab_id, registry=AuthenticatorRegistry({
-                'reset-credentials-choose-user': ResetCredentialChooseUser(),
-                'reset-credential-email': ResetCredentialEmail(), 'reset-password': ResetPassword(),
-            }))
+                'reset-credentials-choose-user': ClassProviderFactory(ResetCredentialChooseUser),
+                'reset-credential-email': ClassProviderFactory(ResetCredentialEmail),
+                'reset-password': ClassProviderFactory(ResetPassword),
+            }), forms=LoginFormsProvider('demo', auth, 'flow-code'))
         outcome = processor.process_flow()
         if not selected:
-            assert outcome.page == 'account'
+            assert outcome.challenge is not None
             outcome = processor.process_action(outcome.execution_id, {'username': 'demo-user'})
-        assert outcome.page == 'login'
+        assert outcome.forked
         assert outcome.execution_id == executions['reset-credential-email']
         assert auth.execution_status == {
             executions['reset-credentials-choose-user']: 'SUCCESS', executions['reset-credential-email']: 'FORK'}
@@ -223,13 +237,19 @@ def assert_legacy_password_session_resumes(application, migrate, *, selected):
         assert historical.consumed and historical.action_token is None
         message = db.session.scalar(select(ResetEmail).where(ResetEmail.authentication_session_id == auth.tab_id))
         assert message is not None and not message.consumed
-        continued, user = ResetActionTokenService(db.session).consume('demo', message.action_token)
+        consumed = ResetActionTokenService(db.session).consume('demo', message.action_token)
+        continued, user = consumed.authentication_session, consumed.user
         assert continued.tab_id == auth.tab_id and user.id == auth.selected_user_id
         auth.auth_notes[ACTION_TOKEN_USER_ID] = user.id
         outcome = processor.process_flow()
-        assert outcome.page == 'password' and outcome.execution_id == executions['reset-password']
-        assert auth.auth_notes[CURRENT_AUTHENTICATION_EXECUTION] == outcome.execution_id
-        assert processor.process_action(outcome.execution_id, {
+        assert outcome.complete
+        required = AuthenticationManager(
+            AuthenticationRepository(db.session), auth, auth.realm, auth.client,
+            RequiredActionRegistry({UPDATE_PASSWORD: ClassProviderFactory(UpdatePassword)}),
+            forms=LoginFormsProvider('demo', auth, 'required-action-code'))
+        outcome = required.required_action_challenge()
+        assert outcome.challenge is not None and outcome.execution_id == UPDATE_PASSWORD
+        assert required.process_required_action(UPDATE_PASSWORD, {
             'password-new': 'Replacement-password-456!', 'password-confirm': 'Replacement-password-456!'}).complete
         db.session.commit()
         assert IdentityRepository(db.session).password_matches(user, 'Replacement-password-456!')
@@ -263,6 +283,9 @@ def test_upgrade_and_downgrade_empty_database(tmp_path):
         for column in inspector.get_columns("authentication_sessions")
     }
     assert authentication_session_columns["version"]["nullable"] is False
+    assert authentication_session_columns["session_code_hash"]["nullable"] is False
+    assert authentication_session_columns["browser_binding_generation"]["nullable"] is False
+    assert authentication_session_columns["required_actions"]["nullable"] is False
 
     subprocess.run(
         [
@@ -306,7 +329,7 @@ def test_oidc_revision_preserves_existing_identity_and_downgrades_to_0001(tmp_pa
         connection.execute(text("INSERT INTO clients (id, realm_id, client_id, enabled, public_client, redirect_uris, web_origins, standard_flow_enabled, direct_access_grants_enabled) VALUES ('c', 'r', 'existing-client', 1, 1, '[]', '[]', 1, 0)"))
     migrate("upgrade", "head")
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0008"
         assert connection.scalar(text("SELECT password_grant_enabled FROM realms")) == 0
         assert connection.execute(text("SELECT name, enabled, forgot_password_allowed FROM realms")).one() == ("existing", 1, 1)
         assert connection.execute(text("SELECT client_id, direct_access_grants_enabled, pkce_policy FROM clients")).one() == ("existing-client", 0, "S256")

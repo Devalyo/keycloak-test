@@ -4,16 +4,15 @@ from collections.abc import Mapping
 
 from sqlalchemy import select
 
-from mini_keycloak.authentication.engine import AuthenticatorResult, FlowStatus
+from mini_keycloak.authentication.constants import ACTION_TOKEN_USER_ID
 from mini_keycloak.models import ResetEmail
 from mini_keycloak.repositories.identity import IdentityRepository
-from mini_keycloak.security.password_policy import password_satisfies_policy
 from mini_keycloak.services.action_tokens import ResetActionTokenService
 from mini_keycloak.services.events import request_event
+from mini_keycloak.reset_credentials.update_password import UPDATE_PASSWORD
 
 
 ATTEMPTED_USERNAME = "attempted.username"
-ACTION_TOKEN_USER_ID = "action.token.user.id"
 RESET_EMAIL_DELIVERY = "reset.email.delivery"
 RESET_MESSAGE = "If the account exists, reset instructions have been sent."
 
@@ -34,22 +33,8 @@ def _validated_user(context):
     return user if message is not None else None
 
 
-def _preceding_required_executions_succeeded(context):
-    flow_id = context.authentication_session.flow_id
-    if flow_id is None:
-        return False
-    for execution in context.repository.executions(flow_id):
-        if execution.id == context.execution.id:
-            return True
-        if (execution.requirement == "REQUIRED"
-                and context.authentication_session.execution_status.get(execution.id) != FlowStatus.SUCCESS.value):
-            return False
-    return False
-
-
-def _failure():
-    return AuthenticatorResult(FlowStatus.FAILURE, page="error",
-                               message="Invalid authentication request", error="invalid_request")
+def _failure(context):
+    context.failure(message="Invalid authentication request")
 
 
 def _event(context, user, event_type):
@@ -60,7 +45,10 @@ def _event(context, user, event_type):
 
 class ResetCredentialChooseUser:
     def authenticate(self, context):
-        return AuthenticatorResult(FlowStatus.CHALLENGE, page="account")
+        if context.form is None:
+            _failure(context)
+            return
+        context.challenge(context.form.create_password_reset(account=True))
 
     def action(self, context, form: Mapping[str, str]):
         identifier = form.get("username", "").strip()
@@ -71,7 +59,7 @@ class ResetCredentialChooseUser:
         context.repository.update_session(auth, auth_notes={
             ATTEMPTED_USERNAME: identifier[:320], ACTION_TOKEN_USER_ID: None,
             RESET_EMAIL_DELIVERY: None})
-        return AuthenticatorResult(FlowStatus.SUCCESS)
+        context.success()
 
 
 class ResetCredentialEmail:
@@ -80,7 +68,8 @@ class ResetCredentialEmail:
 
     def authenticate(self, context):
         if _validated_user(context) is not None:
-            return AuthenticatorResult(FlowStatus.SUCCESS)
+            context.success()
+            return
         user = context.user
         if user is not None and user.enabled and user.email:
             auth = context.authentication_session
@@ -90,43 +79,27 @@ class ResetCredentialEmail:
                 tokens = self.action_tokens or ResetActionTokenService(context.repository.session)
                 tokens.issue(auth, user)
                 _event(context, user, "SEND_RESET_PASSWORD")
-        return AuthenticatorResult(FlowStatus.FORK, page="login", message=RESET_MESSAGE)
+        context.fork(RESET_MESSAGE)
 
     def action(self, context, form: Mapping[str, str]):
         user = context.user
         if user is None or not user.enabled:
-            return _failure()
+            _failure(context)
+            return
         user.email_verified = True
-        return AuthenticatorResult(FlowStatus.SUCCESS)
+        context.success()
 
 
 class ResetPassword:
     def authenticate(self, context):
         user = context.user
-        if (user is None or not user.enabled
-                or not _preceding_required_executions_succeeded(context)):
-            return _failure()
-        return AuthenticatorResult(FlowStatus.CHALLENGE, page="password")
+        if user is None or not user.enabled:
+            _failure(context)
+            return
+        auth = context.authentication_session
+        if UPDATE_PASSWORD not in auth.required_actions:
+            auth.required_actions.append(UPDATE_PASSWORD)
+        context.success()
 
     def action(self, context, form: Mapping[str, str]):
-        user = context.user
-        if (user is None or not user.enabled
-                or not _preceding_required_executions_succeeded(context)):
-            return _failure()
-        password = form.get("password-new", "")
-        policy = context.realm.password_policy
-        clauses = policy.get("clauses", {}) if isinstance(policy, Mapping) else None
-        if (not password or password != form.get("password-confirm", "")
-                or not isinstance(clauses, Mapping)
-                or not set(clauses) <= {"length", "digits", "lowerCase", "upperCase", "specialChars"}
-                or any(type(minimum) is not int or minimum < 0 for minimum in clauses.values())
-                or not password_satisfies_policy(password, clauses)):
-            return AuthenticatorResult(FlowStatus.CHALLENGE, page="password",
-                                       message="Passwords must match and meet realm policy.")
-        IdentityRepository(context.repository.session).set_password(user, password)
-        auth = context.authentication_session
-        auth.password_update_allowed = False
-        context.repository.update_session(auth, auth_notes={ACTION_TOKEN_USER_ID: None})
-        _event(context, user, "UPDATE_PASSWORD")
-        _event(context, user, "UPDATE_CREDENTIAL")
-        return AuthenticatorResult(FlowStatus.SUCCESS)
+        self.authenticate(context)

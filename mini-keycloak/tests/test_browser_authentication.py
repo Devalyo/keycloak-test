@@ -4,7 +4,11 @@ import pytest
 from sqlalchemy import func, select
 
 from mini_keycloak.extensions import db
-from mini_keycloak.models import AuthenticationSession, Client, Realm, User, UserSession
+from mini_keycloak.models import (
+    AuthenticationSession, AuthorizationCode, Client, Realm, SecurityEvent, User,
+    UserSession,
+)
+from mini_keycloak.authentication.login_actions import LoginActionsService
 from mini_keycloak.models.identity import utc_now
 from mini_keycloak.repositories.identity import IdentityRepository
 from tests.helpers import form_action, query_value
@@ -32,6 +36,22 @@ def begin(client, **overrides):
 def login(client):
     action = form_action(begin(client).text, 'login-actions/authenticate')
     return client.post(action, data={'username': 'demo-user', 'password': 'DemoPassw0rd!'})
+
+
+def test_authenticate_route_is_a_thin_login_actions_adapter(client, monkeypatch):
+    calls = []
+
+    def delegated(self, realm):
+        calls.append(realm)
+        return "delegated", 202
+
+    monkeypatch.setattr(LoginActionsService, "authenticate", delegated, raising=False)
+
+    response = client.post('/realms/demo/login-actions/authenticate')
+
+    assert response.status_code == 202
+    assert response.text == "delegated"
+    assert calls == ["demo"]
 
 
 @pytest.mark.parametrize('changes', [
@@ -133,6 +153,10 @@ def test_successful_login_creates_session_and_cannot_be_replayed(app, client):
         session = db.session.scalar(select(UserSession))
         assert session.user_id == db.session.scalar(select(User.id))
         assert session.auth_time <= utc_now() < session.idle_expires_at <= session.max_expires_at
+        assert db.session.scalar(select(func.count(UserSession.id))) == 1
+        assert db.session.scalar(select(func.count(AuthorizationCode.id))) == 1
+        assert db.session.scalar(select(func.count(SecurityEvent.id)).where(
+            SecurityEvent.event_type == 'LOGIN')) == 1
 
 
 @pytest.mark.parametrize('bad_request', [False, True])

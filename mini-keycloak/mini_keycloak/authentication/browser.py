@@ -1,11 +1,10 @@
 from datetime import timedelta
-import hmac
 from ipaddress import IPv6Address
 import re
 import secrets
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlsplit
 
-from flask import Blueprint, abort, current_app, make_response, redirect, render_template, request
+from flask import Blueprint, abort, current_app, make_response, render_template, request
 from itsdangerous import BadData
 from sqlalchemy.orm.exc import StaleDataError
 from werkzeug.datastructures import MultiDict
@@ -13,24 +12,23 @@ from werkzeug.exceptions import HTTPException
 
 from mini_keycloak.extensions import db
 from mini_keycloak.authentication.constants import AUTHENTICATION_FLOW_COMPLETED
-from mini_keycloak.models import AuthenticationSession
+from mini_keycloak.authentication.forms import LoginFormsProvider
+from mini_keycloak.authentication.session_codes import (
+    PREAUTH_COOKIE_PREFIX, SessionContinuation, browser_binding,
+)
+from mini_keycloak.models import AuthenticationSession, User
 from mini_keycloak.models.identity import utc_now
-from mini_keycloak.oidc.authorization import authorization_error, authorization_redirect
+from mini_keycloak.oidc.authorization import authorization_error
 from mini_keycloak.oidc.errors import InvalidRequest, OAuthError, UnauthorizedClient
-from mini_keycloak.repositories.authentication import AuthenticationRepository
 from mini_keycloak.repositories.identity import IdentityRepository
-from mini_keycloak.services.sessions import BrowserAuthenticationResult, UserSessionService
-from mini_keycloak.services.tokens import realm_issuer
-from mini_keycloak.services.authorization import AuthorizationService
+from mini_keycloak.services.sessions import UserSessionService
 from mini_keycloak.services.authentication_flows import AuthenticationFlowService
-from mini_keycloak.services.events import request_event, request_failure
+from mini_keycloak.services.events import request_failure
 from mini_keycloak.security.logging import log_failure
-from mini_keycloak.security.login_throttling import CredentialFailure, LoginThrottle
 
 
 browser = Blueprint('browser', __name__)
 COOKIE_NAME = 'mini_keycloak_session'
-PREAUTH_COOKIE_PREFIX = 'mini_keycloak_login_'
 SUPPORTED_SCOPES = {'openid', 'profile', 'email'}
 OIDC_FIELDS = ('redirect_uri', 'response_type', 'scope', 'state', 'nonce',
                'code_challenge', 'code_challenge_method')
@@ -42,14 +40,8 @@ def session_service():
         max_seconds=current_app.config['SSO_MAX_LIFETIME_SECONDS'])
 
 
-def login_page(realm, session, message=''):
-    path = f'/realms/{quote(realm, safe="")}/login-actions/'
-    params = dict(client_id=session.client.client_id, tab_id=session.tab_id)
-    return render_template('login.html',
-        display_name=session.realm.display_name or realm, message=message,
-        action=path + 'authenticate?' + urlencode(params | {'execution': 'login'}),
-        reset_url=path + 'reset-credentials?' + urlencode(params),
-        forgot_password_allowed=session.realm.forgot_password_allowed)
+def login_page(realm, session, session_code, message=''):
+    return LoginFormsProvider(realm, session, session_code).create_login(message)
 
 
 def validate_authorization(realm_name, args):
@@ -105,19 +97,14 @@ def browser_sid():
 
 def preauth_token(session):
     """Opaque proof that this browser received this realm's login transaction."""
-    secret = current_app.secret_key
-    if isinstance(secret, str):
-        secret = secret.encode()
-    binding = f'mini-keycloak:preauth:v1\0{session.realm_id}\0{session.tab_id}'.encode()
-    return hmac.new(secret, binding, 'sha256').hexdigest()
+    return browser_binding(session)
 
 
 def preauth_cookie_options(session):
-    # One cookie per tab preserves independent login forms. Restrict its path
-    # to ordinary authentication so it is not sent to reset actions.
+    # One cookie per tab preserves independent login forms across login actions.
     return dict(httponly=True, samesite='Lax',
         secure=current_app.config['SESSION_COOKIE_SECURE'],
-        path=f'/realms/{quote(session.realm.name, safe="")}/login-actions/authenticate')
+        path=f'/realms/{quote(session.realm.name, safe="")}/login-actions/')
 
 
 def canonical_origin(value, *, allow_path=False):
@@ -139,27 +126,6 @@ def canonical_origin(value, *, allow_path=False):
         return None
 
 
-def complete_authentication(result: BrowserAuthenticationResult):
-    """Commit browser authentication and its authorization code together."""
-    code = AuthorizationService(db.session,
-        lifetime_seconds=current_app.config['AUTHORIZATION_CODE_LIFETIME_SECONDS']).issue(result)
-    request_event(db.session, result.authentication_session.realm_id, 'LOGIN',
-        client_id=result.authentication_session.client_id, user_id=result.user_session.user_id,
-        user_session_id=result.user_session.id)
-    db.session.commit()
-    parameters = {'code': code}
-    if result.authentication_session.state is not None:
-        parameters['state'] = result.authentication_session.state
-    response = redirect(authorization_redirect(result.authentication_session.redirect_uri, parameters))
-    serializer = current_app.session_interface.get_signing_serializer(current_app)
-    response.set_cookie(COOKIE_NAME, serializer.dumps({'sid': result.user_session.sid}),
-        httponly=True, samesite='Lax', secure=current_app.config['SESSION_COOKIE_SECURE'],
-        path=f'/realms/{quote(result.authentication_session.realm.name, safe="")}/')
-    response.delete_cookie(PREAUTH_COOKIE_PREFIX + result.authentication_session.tab_id,
-        **preauth_cookie_options(result.authentication_session))
-    return response
-
-
 @browser.get('/realms/<realm>/protocol/openid-connect/auth')
 def authorize(realm):
     enabled_realm, client = validate_authorization(realm, request.args)
@@ -175,13 +141,20 @@ def authorize(realm):
         **{name: request.args.get(name) for name in OIDC_FIELDS})
     db.session.add(session)
     db.session.flush()
+    session_code = SessionContinuation.issue(session)
     sid = browser_sid()
     user_session = session_service().reuse(sid, enabled_realm) if sid else None
     if user_session is not None:
         session.auth_notes[AUTHENTICATION_FLOW_COMPLETED] = 'true'
-        return complete_authentication(BrowserAuthenticationResult(session, user_session))
+        user = db.session.get(User, user_session.user_id)
+        if user is None or not user.enabled:
+            abort(400)
+        from mini_keycloak.authentication.login_actions import LoginActionsService
+        return LoginActionsService(db.session).complete_authentication(
+            session, user, user_session=user_session
+        )
     db.session.commit()
-    response = make_response(login_page(realm, session))
+    response = make_response(login_page(realm, session, session_code))
     response.set_cookie(PREAUTH_COOKIE_PREFIX + session.tab_id, preauth_token(session),
         max_age=1800, **preauth_cookie_options(session))
     return response
@@ -189,49 +162,8 @@ def authorize(realm):
 
 @browser.post('/realms/<realm>/login-actions/authenticate')
 def authenticate(realm):
-    if (request.args.get('execution') != 'login'
-            or any(len(request.args.getlist(key)) != 1 for key in request.args)
-            or any(len(request.form.getlist(key)) != 1 for key in request.form)):
-        abort(400)
-    session = AuthenticationRepository(db.session).get_session(request.args.get('tab_id', ''))
-    if (session is None or session.realm.name != realm
-            or session.client.realm_id != session.realm_id
-            or session.client.client_id != request.args.get('client_id')
-            or session.current_execution == 'authenticated'
-            or any(status == 'SUCCESS' for status in session.execution_status.values())):
-        abort(400)
-    # Browser hints add defense in depth to the mandatory pre-auth cookie.
-    # Only trusted realm/configuration state selects the accepted origin.
-    origin = request.headers.get('Origin')
-    expected_origin = canonical_origin(
-        realm_issuer(session.realm, current_app.config['EXTERNAL_URL']), allow_path=True)
-    if ((origin is not None and (expected_origin is None or canonical_origin(origin) != expected_origin))
-            or request.headers.get('Sec-Fetch-Site') not in (None, 'same-origin')):
-        abort(400)
-    supplied_token = request.cookies.get(PREAUTH_COOKIE_PREFIX + session.tab_id, '')
-    if not hmac.compare_digest(supplied_token.encode(), preauth_token(session).encode()):
-        abort(400)
-    enabled_realm, client = validate_stored_authorization(realm, session)
-    throttle = LoginThrottle.from_config(db.session, current_app.config)
-    try:
-        user, bucket_hash = throttle.authenticate(enabled_realm.id, request.form.get('username', ''),
-            request.form.get('password', ''), source_address=request.remote_addr,
-            dummy_hash=current_app.extensions['browser_dummy_hash'])
-    except CredentialFailure as error:
-        if not error.blocked:
-            throttle.record_failure(error.realm_id, error.bucket_hash)
-        request_event(db.session, enabled_realm.id, 'LOGIN_ERROR', client_id=client.id,
-                      error='invalid_credentials', details={'reason': 'credentials'})
-        db.session.commit()
-        return login_page(realm, session, 'Invalid username or password.'), 401
-    try:
-        throttle.clear(enabled_realm.id, bucket_hash)
-        user_session = session_service().create(enabled_realm, client, user)
-        session.auth_notes[AUTHENTICATION_FLOW_COMPLETED] = 'true'
-        return complete_authentication(BrowserAuthenticationResult(session, user_session))
-    except StaleDataError:
-        db.session.rollback()
-        abort(400)
+    from mini_keycloak.authentication.login_actions import LoginActionsService
+    return LoginActionsService(db.session).authenticate(realm)
 
 
 @browser.errorhandler(HTTPException)
@@ -246,6 +178,13 @@ def oauth_error(error):
     db.session.rollback()
     request_failure(db.session, request.view_args['realm'], 'LOGIN_ERROR', error=error.error)
     return authorization_error(error)
+
+
+@browser.errorhandler(StaleDataError)
+def stale_browser_transition(error):
+    db.session.rollback()
+    request_failure(db.session, request.view_args['realm'], 'LOGIN_ERROR', error='invalid_request')
+    return render_template('error.html'), 400
 
 
 @browser.errorhandler(Exception)

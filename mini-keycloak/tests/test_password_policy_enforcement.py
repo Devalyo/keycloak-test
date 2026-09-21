@@ -5,11 +5,12 @@ import pytest
 from sqlalchemy import select
 
 from mini_keycloak.authentication import (
-    AuthenticationProcessor, AuthenticatorContext, AuthenticatorRegistry, FlowStatus,
+    AuthenticationManager, AuthenticationProcessor, AuthenticatorRegistry, ClassProviderFactory,
+    RequiredActionRegistry,
 )
 from mini_keycloak.authentication.constants import (
-    AUTHENTICATION_FLOW_COMPLETED, CURRENT_AUTHENTICATION_EXECUTION,
-    RESET_CREDENTIALS_CHOOSE_USER, RESET_CREDENTIAL_EMAIL, RESET_PASSWORD,
+    AUTHENTICATION_FLOW_COMPLETED, RESET_CREDENTIALS_CHOOSE_USER,
+    RESET_CREDENTIAL_EMAIL, RESET_PASSWORD,
 )
 from mini_keycloak.extensions import db
 from mini_keycloak.import_export.validation import validate_realm_import
@@ -20,6 +21,9 @@ from mini_keycloak.repositories.authentication import AuthenticationRepository
 from mini_keycloak.reset_credentials.authenticators import (
     ACTION_TOKEN_USER_ID, ResetCredentialChooseUser, ResetCredentialEmail, ResetPassword,
 )
+from mini_keycloak.reset_credentials.update_password import UPDATE_PASSWORD, UpdatePassword
+from mini_keycloak.authentication.session_codes import SessionContinuation, browser_binding
+from mini_keycloak.authentication.forms import LoginFormsProvider
 from mini_keycloak.security.passwords import PasswordService
 from mini_keycloak.services.action_tokens import ResetActionTokenService
 from mini_keycloak.services.authentication_flows import AuthenticationFlowService
@@ -52,9 +56,17 @@ def processor(session):
     return AuthenticationProcessor(db.session, realm_name=session.realm.name,
         client_id=session.client.client_id, tab_id=session.tab_id,
         registry=AuthenticatorRegistry({
-            RESET_CREDENTIALS_CHOOSE_USER: ResetCredentialChooseUser(),
-            RESET_CREDENTIAL_EMAIL: ResetCredentialEmail(), RESET_PASSWORD: ResetPassword(),
-        }))
+            RESET_CREDENTIALS_CHOOSE_USER: ClassProviderFactory(ResetCredentialChooseUser),
+            RESET_CREDENTIAL_EMAIL: ClassProviderFactory(ResetCredentialEmail),
+            RESET_PASSWORD: ClassProviderFactory(ResetPassword),
+        }), forms=LoginFormsProvider(session.realm.name, session, 'flow-code'))
+
+
+def required_processor(session):
+    return AuthenticationManager(
+        AuthenticationRepository(db.session), session, session.realm, session.client,
+        RequiredActionRegistry({UPDATE_PASSWORD: ClassProviderFactory(UpdatePassword)}),
+        forms=LoginFormsProvider(session.realm.name, session, 'required-action-code'))
 
 
 def permitted_session(realm):
@@ -70,15 +82,18 @@ def permitted_session(realm):
     db.session.add(session)
     db.session.flush()
     flow_processor = processor(session)
-    assert flow_processor.process_flow().page == 'account'
+    assert flow_processor.process_flow().challenge is not None
     assert flow_processor.process_action(executions[RESET_CREDENTIALS_CHOOSE_USER],
-                                         {'username': user.username}).page == 'login'
+                                         {'username': user.username}).forked
     message = db.session.scalar(select(ResetEmail))
-    continued, selected = ResetActionTokenService(db.session).consume(realm.name, message.action_token)
+    consumed = ResetActionTokenService(db.session).consume(realm.name, message.action_token)
+    continued, selected = consumed.authentication_session, consumed.user
     assert continued is session and selected.id == user.id
     session.auth_notes[ACTION_TOKEN_USER_ID] = selected.id
     outcome = flow_processor.process_flow()
-    assert outcome.page == 'password' and outcome.execution_id == executions[RESET_PASSWORD]
+    assert outcome.complete
+    outcome = required_processor(session).required_action_challenge()
+    assert outcome.challenge is not None and outcome.execution_id == UPDATE_PASSWORD
     db.session.commit()
     return session
 
@@ -90,33 +105,30 @@ def assert_policy_rejection_preserves_state(session, password, monkeypatch):
     def forbidden_hash(self, _password):
         pytest.fail('Policy rejection must happen before hashing')
 
-    execution = next(item for item in AuthenticationFlowService(db.session).executions(session.flow_id)
-                     if item.authenticator == RESET_PASSWORD)
-    context = AuthenticatorContext(AuthenticationRepository(db.session), session,
-                                   session.realm, session.client, execution)
     with monkeypatch.context() as patch:
         patch.setattr(PasswordService, 'hash', forbidden_hash)
-        result = ResetPassword().action(context, {
+        result = required_processor(session).process_required_action(UPDATE_PASSWORD, {
             'password-new': password, 'password-confirm': password})
-    assert result.status == FlowStatus.CHALLENGE and result.page == 'password'
+    assert result.challenge is not None and not result.complete
     assert result.message == 'Passwords must match and meet realm policy.'
     db.session.commit()
     assert db.session.execute(select(Credential.__table__)).one() == original_credential
     assert db.session.execute(select(AuthenticationSession.__table__)).one() == original_session
     assert session.auth_notes[ACTION_TOKEN_USER_ID] == session.selected_user_id
-    assert session.auth_notes[CURRENT_AUTHENTICATION_EXECUTION] == execution.id
-    assert AUTHENTICATION_FLOW_COMPLETED not in session.auth_notes
+    assert session.current_required_action == UPDATE_PASSWORD
+    assert session.auth_notes[AUTHENTICATION_FLOW_COMPLETED] == 'true'
 
 
 def update_password(session, password):
     execution = next(item for item in AuthenticationFlowService(db.session).executions(session.flow_id)
                      if item.authenticator == RESET_PASSWORD)
-    assert processor(session).process_action(execution.id, {
+    assert required_processor(session).process_required_action(UPDATE_PASSWORD, {
         'password-new': password, 'password-confirm': password}).complete
     db.session.commit()
     assert ACTION_TOKEN_USER_ID not in session.auth_notes
     assert session.auth_notes[AUTHENTICATION_FLOW_COMPLETED] == 'true'
     assert session.execution_status[execution.id] == 'SUCCESS'
+    assert session.required_actions == [] and session.current_required_action is None
 
 
 def test_password_continuation_preserves_required_action_form_contract(db_app):
@@ -124,19 +136,24 @@ def test_password_continuation_preserves_required_action_form_contract(db_app):
         realm = import_policy_realm(db_app)
         session = permitted_session(realm)
         tab_id = session.tab_id
-        execution_id = next(item.id for item in
-            AuthenticationFlowService(db.session).executions(session.flow_id)
-            if item.authenticator == RESET_PASSWORD)
-    response = db_app.test_client().get(
+        session_code = SessionContinuation.issue(session)
+        binding = browser_binding(session)
+        db.session.commit()
+    client = db_app.test_client()
+    client.set_cookie('mini_keycloak_login_' + tab_id, binding,
+                      path='/realms/password-policy/login-actions/')
+    response = client.get(
         '/realms/password-policy/login-actions/reset-credentials',
-        query_string={'client_id': 'browser', 'tab_id': tab_id})
+        query_string={'client_id': 'browser', 'tab_id': tab_id,
+                      'session_code': session_code})
     assert response.status_code == 200
     action = form_action(response.text, '/realms/password-policy/login-actions/required-action')
     assert urlsplit(action).path == '/realms/password-policy/login-actions/required-action'
-    assert set(parse_qs(urlsplit(action).query)) == {'client_id', 'tab_id', 'execution'}
+    assert set(parse_qs(urlsplit(action).query)) == {
+        'client_id', 'tab_id', 'execution', 'session_code'}
     assert query_value(action, 'client_id') == 'browser'
     assert query_value(action, 'tab_id') == tab_id
-    assert query_value(action, 'execution') == execution_id
+    assert query_value(action, 'execution') == UPDATE_PASSWORD
     assert 'name="password-new"' in response.text
     assert 'name="password-confirm"' in response.text
 

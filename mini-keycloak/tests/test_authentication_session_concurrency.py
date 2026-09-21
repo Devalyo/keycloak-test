@@ -1,12 +1,20 @@
 import pytest
 from flask import request
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.exc import StaleDataError
 
 from mini_keycloak.extensions import db
-from mini_keycloak.models import AuthenticationSession, ResetEmail
-from mini_keycloak.authentication import AuthenticationProcessor, AuthenticatorRegistry
+from mini_keycloak.models import (
+    AuthenticationSession, AuthorizationCode, Client, Realm, ResetEmail,
+    SecurityEvent, User, UserSession,
+)
+from mini_keycloak.authentication import (
+    AuthenticationManager, AuthenticationProcessor, AuthenticatorRegistry, ClassProviderFactory,
+    RequiredActionRegistry,
+)
+from mini_keycloak.authentication.forms import LoginFormsProvider
+from mini_keycloak.authentication.login_actions import LoginActionsService
 from mini_keycloak.authentication.constants import (
     AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED, RESET_CREDENTIALS_CHOOSE_USER,
     RESET_CREDENTIAL_EMAIL, RESET_PASSWORD,
@@ -14,6 +22,8 @@ from mini_keycloak.authentication.constants import (
 from mini_keycloak.reset_credentials.authenticators import (
     ACTION_TOKEN_USER_ID, ResetCredentialChooseUser, ResetCredentialEmail, ResetPassword,
 )
+from mini_keycloak.reset_credentials.update_password import UPDATE_PASSWORD, UpdatePassword
+from mini_keycloak.repositories.authentication import AuthenticationRepository
 from mini_keycloak.services.action_tokens import ResetActionTokenService
 from mini_keycloak.services.authentication_flows import AuthenticationFlowService
 from mini_keycloak.services.bootstrap import ensure_demo_realm
@@ -23,10 +33,19 @@ from mini_keycloak.store import PersistentStore
 def _processor(session, tab_id):
     return AuthenticationProcessor(session, realm_name='demo', client_id='demo-app',
         tab_id=tab_id, registry=AuthenticatorRegistry({
-            RESET_CREDENTIALS_CHOOSE_USER: ResetCredentialChooseUser(),
-            RESET_CREDENTIAL_EMAIL: ResetCredentialEmail(),
-            RESET_PASSWORD: ResetPassword(),
-        }))
+            RESET_CREDENTIALS_CHOOSE_USER: ClassProviderFactory(ResetCredentialChooseUser),
+            RESET_CREDENTIAL_EMAIL: ClassProviderFactory(ResetCredentialEmail),
+            RESET_PASSWORD: ClassProviderFactory(ResetPassword),
+        }), forms=LoginFormsProvider('demo', session.get(AuthenticationSession, tab_id), 'flow-code'))
+
+
+def _required_processor(session, authentication_session):
+    return AuthenticationManager(
+        AuthenticationRepository(session), authentication_session,
+        session.get(Realm, authentication_session.realm_id),
+        session.get(Client, authentication_session.client_id),
+        RequiredActionRegistry({UPDATE_PASSWORD: ClassProviderFactory(UpdatePassword)}),
+        forms=LoginFormsProvider('demo', authentication_session, 'required-action-code'))
 
 
 def _create_authentication_session(*, advance_to_password: bool = False):
@@ -40,11 +59,15 @@ def _create_authentication_session(*, advance_to_password: bool = False):
     auth_session.flow_id = realm.reset_credentials_flow_id
     if advance_to_password:
         processor = _processor(db.session, auth_session.tab_id)
+        assert processor.process_flow().challenge is not None
         processor.process_action(executions[0].id, {'username': 'demo-user'})
         message = db.session.scalar(select(ResetEmail))
-        _, user = ResetActionTokenService(db.session).consume('demo', message.action_token)
+        user = ResetActionTokenService(db.session).consume(
+            'demo', message.action_token
+        ).user
         auth_session.auth_notes[ACTION_TOKEN_USER_ID] = user.id
-        assert processor.process_flow().page == 'password'
+        assert processor.process_flow().complete
+        assert _required_processor(db.session, auth_session).required_action_challenge().challenge is not None
     db.session.commit()
     return auth_session.tab_id, realm.id, auth_session.selected_user_id
 
@@ -92,17 +115,23 @@ def test_concurrent_password_update_loser_cannot_overwrite_winner(db_app):
             loser_auth = loser_session.get(AuthenticationSession, tab_id)
             assert winner_auth is not None
             assert loser_auth is not None
-            winner_flow = _processor(winner_session, tab_id)
-            loser_flow = _processor(loser_session, tab_id)
+            winner_flow = _required_processor(winner_session, winner_auth)
+            loser_flow = _required_processor(loser_session, loser_auth)
+            winner_user = winner_session.get(User, user_id)
+            loser_user = loser_session.get(User, user_id)
 
-            winner_flow.process_action(winner_auth.current_execution,
+            winner_flow.process_required_action(UPDATE_PASSWORD,
                 {'password-new': 'WinnerPassw0rd!', 'password-confirm': 'WinnerPassw0rd!'})
-            winner_session.commit()
+            LoginActionsService(winner_session).complete_authentication(
+                winner_auth, winner_user
+            )
 
             with pytest.raises(StaleDataError):
-                loser_flow.process_action(loser_auth.current_execution,
+                loser_flow.process_required_action(UPDATE_PASSWORD,
                     {'password-new': 'LoserPassw0rd!', 'password-confirm': 'LoserPassw0rd!'})
-                loser_session.commit()
+                LoginActionsService(loser_session).complete_authentication(
+                    loser_auth, loser_user
+                )
             loser_session.rollback()
 
         verifier = PersistentStore(db.session)
@@ -110,6 +139,10 @@ def test_concurrent_password_update_loser_cannot_overwrite_winner(db_app):
         assert user is not None
         assert verifier.password_matches(user, "WinnerPassw0rd!")
         assert not verifier.password_matches(user, "LoserPassw0rd!")
+        assert db.session.scalar(select(func.count(UserSession.id))) == 1
+        assert db.session.scalar(select(func.count(AuthorizationCode.id))) == 1
+        assert db.session.scalar(select(func.count(SecurityEvent.id)).where(
+            SecurityEvent.event_type == 'LOGIN')) == 1
 
 
 def test_http_flow_returns_400_and_rolls_back_stale_transition(db_app):

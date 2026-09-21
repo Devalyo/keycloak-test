@@ -3,6 +3,7 @@
 CURRENT_AUTHENTICATION_EXECUTION = "current.authentication.execution"
 AUTHENTICATION_SELECTOR_SCREEN_DISPLAYED = "auth.selector.screen.rendered"
 AUTHENTICATION_FLOW_COMPLETED = "authentication.flow.completed"
+ACTION_TOKEN_USER_ID = "action.token.user.id"
 
 RESET_CREDENTIALS_CHOOSE_USER = "reset-credentials-choose-user"
 RESET_CREDENTIAL_EMAIL = "reset-credential-email"

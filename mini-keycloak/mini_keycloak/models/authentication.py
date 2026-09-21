@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import re
 import secrets
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
-from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from mini_keycloak.extensions import db
@@ -55,6 +56,18 @@ class AuthenticationSession(db.Model):
     auth_notes: Mapped[dict[str, str]] = mapped_column(
         MutableDict.as_mutable(JSON), default=dict, nullable=False
     )
+    session_code_hash: Mapped[str] = mapped_column(
+        String(64),
+        default=lambda: hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
+        nullable=False,
+    )
+    browser_binding_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    required_actions: Mapped[list[str]] = mapped_column(
+        MutableList.as_mutable(JSON), default=list, server_default="[]", nullable=False
+    )
+    current_required_action: Mapped[str | None] = mapped_column(String(128))
     password_update_allowed: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )

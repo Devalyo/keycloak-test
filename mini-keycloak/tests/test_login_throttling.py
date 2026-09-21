@@ -157,7 +157,9 @@ def test_password_failures_survive_oauth_rollback_and_block_without_success(app,
 def test_browser_and_password_grant_share_failure_bucket(app, client):
     app.config['LOGIN_FAILURE_THRESHOLD'] = 2
     action = form_action(begin(client).text, 'login-actions/authenticate')
-    assert client.post(action, data={'username': ' DEMO-USER ', 'password': 'wrong'}).status_code == 401
+    failed = client.post(action, data={'username': ' DEMO-USER ', 'password': 'wrong'})
+    assert failed.status_code == 401
+    action = form_action(failed.text, 'login-actions/authenticate')
     assert password_grant(client, password='wrong').status_code == 400
     response = client.post(action, data={'username': 'demo-user', 'password': 'DemoPassw0rd!'})
     assert response.status_code == 401

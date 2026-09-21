@@ -38,7 +38,7 @@ def test_empty_database_round_trip_matches_metadata(postgres_database):
             else:
                 assert tables == set(db.metadata.tables) | {"alembic_version"}
                 with db.engine.connect() as connection:
-                    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
+                    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0008"
                     assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
                 # Alembic comparison covers columns/types/FKs/unique constraints
                 # and indexes; primary-key column changes need an explicit check.
@@ -137,7 +137,9 @@ def test_throttle_revision_preserves_all_other_rows(postgres_app, postgres_datab
             assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
 
 
-@pytest.mark.parametrize("revision, previous", [("0005", "0004"), ("0006", "0005"), ("0007", "0006")])
+@pytest.mark.parametrize("revision, previous", [
+    ("0005", "0004"), ("0006", "0005"), ("0007", "0006"), ("0008", "0007"),
+])
 @pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
 def test_revision_write_failure_rolls_back_ddl_and_data_then_retries(
         postgres_app, postgres_database, revision, previous, direction):
