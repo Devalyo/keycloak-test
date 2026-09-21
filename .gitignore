@@ -1,0 +1,12 @@
+.worktrees/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.db
+*.sqlite3
+dist/
+build/
+*.egg-info/

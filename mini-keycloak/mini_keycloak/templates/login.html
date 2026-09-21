@@ -1,0 +1,10 @@
+<!doctype html>
+<html><head><title>Sign in</title></head><body>
+<h1>{{ display_name }}</h1>
+<p>{{ message }}</p>
+<form method="post" action="{{ action }}">
+<label>Username <input name="username" autocomplete="username"></label>
+<label>Password <input name="password" type="password" autocomplete="current-password"></label>
+<button>Sign in</button></form>
+{% if forgot_password_allowed %}<a href="{{ reset_url }}">Forgot password?</a>{% endif %}
+</body></html>

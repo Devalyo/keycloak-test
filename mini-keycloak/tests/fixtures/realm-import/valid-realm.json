@@ -1,0 +1,42 @@
+{
+  "realm": "example",
+  "displayName": "Isolated example realm",
+  "enabled": true,
+  "resetPasswordAllowed": false,
+  "passwordPolicy": "length(12) and digits(1)",
+  "accessTokenLifespan": 300,
+  "accessCodeLifespan": 60,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "attributes": {"mini.keycloak.passwordGrantEnabled": "false"},
+  "clients": [
+    {
+      "clientId": "example-browser",
+      "name": "Local browser example",
+      "enabled": true,
+      "publicClient": true,
+      "redirectUris": ["http://127.0.0.1:8080/callback"],
+      "webOrigins": ["http://127.0.0.1:8080"],
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["openid", "profile", "email"],
+      "optionalClientScopes": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://127.0.0.1:8080/signed-out"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "example-user",
+      "email": "example-user@example.test",
+      "enabled": true,
+      "emailVerified": false,
+      "firstName": "Example",
+      "lastName": "User",
+      "attributes": {"team": ["local-development"]},
+      "credentials": [{"type": "password", "value": "Example-local-only-123!", "temporary": false}]
+    }
+  ]
+}

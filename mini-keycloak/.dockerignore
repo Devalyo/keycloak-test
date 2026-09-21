@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!mini_keycloak/
+!mini_keycloak/**
+!migrations/
+!migrations/**
+!gunicorn.conf.py
+**/__pycache__/**
+**/*.pyc
