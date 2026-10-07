@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import escape
+import os
 import secrets
 from urllib.parse import urlencode
 
@@ -68,10 +69,10 @@ def _request_session(store: InMemoryStore) -> AuthenticationSession:
     return session
 
 
-def create_app(store: InMemoryStore | None = None) -> Flask:
+def create_app(store: InMemoryStore | None = None, state_mode: str = "notes") -> Flask:
     app = Flask(__name__)
     app_store = store or InMemoryStore()
-    flow = ResetFlow(app_store)
+    flow = ResetFlow(app_store, state_mode)
     app.extensions["mini_keycloak_store"] = app_store
 
     @app.get("/realms/<realm>/protocol/openid-connect/auth")
@@ -126,6 +127,17 @@ def create_app(store: InMemoryStore | None = None) -> Flask:
         location = f"{session.redirect_uri}?{urlencode({'code': secrets.token_urlsafe(18), 'state': 'poc'})}"
         return redirect(location, code=302)
 
+    @app.get("/realms/<realm>/login-actions/action-token")
+    def action_token(realm: str):
+        if realm != REALM:
+            abort(404)
+        session = _request_session(app_store)
+        try:
+            flow.consume_email_token(session, request.args.get("token", ""))
+        except FlowStateError as exc:
+            abort(400, str(exc))
+        return _password_form(realm, session)
+
     @app.post("/realms/<realm>/protocol/openid-connect/token")
     def token(realm: str):
         user = app_store.find_user(request.form.get("username", ""))
@@ -162,7 +174,9 @@ def create_app(store: InMemoryStore | None = None) -> Flask:
 
 
 def main() -> None:
-    create_app().run(host="127.0.0.1", port=5000, debug=False)
+    create_app(state_mode=os.environ.get("RESET_STATE_MODE", "notes")).run(
+        host="127.0.0.1", port=5000, debug=False
+    )
 
 
 if __name__ == "__main__":

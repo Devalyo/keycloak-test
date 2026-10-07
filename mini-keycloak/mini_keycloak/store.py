@@ -16,20 +16,27 @@ class User:
 
 
 @dataclass
+class ResetState:
+    selected_user_id: str | None = None
+    email_confirmed_user_id: str | None = None
+    password_update_allowed: bool = False
+
+
+@dataclass
 class AuthenticationSession:
     tab_id: str
     client_id: str
     redirect_uri: str
     current_execution: str
-    selected_user_id: str | None = None
     auth_notes: dict[str, str] = field(default_factory=dict)
-    password_update_allowed: bool = False
+    reset_state: ResetState = field(default_factory=ResetState)
 
 
 @dataclass
 class ResetEmail:
     recipient: str
     user_id: str
+    tab_id: str
     action_token: str
     consumed: bool = False
 
@@ -67,10 +74,11 @@ class InMemoryStore:
     def get_user(self, user_id: str | None) -> User | None:
         return self.users_by_id.get(user_id) if user_id else None
 
-    def queue_reset_email(self, user: User) -> ResetEmail:
+    def queue_reset_email(self, user: User, tab_id: str) -> ResetEmail:
         message = ResetEmail(
             recipient=user.email,
             user_id=user.id,
+            tab_id=tab_id,
             action_token=secrets.token_urlsafe(24),
         )
         self.outbox.append(message)
@@ -79,7 +87,3 @@ class InMemoryStore:
     @staticmethod
     def password_matches(user: User, raw_password: str) -> bool:
         return check_password_hash(user.password_hash, raw_password)
-
-    @staticmethod
-    def set_password(user: User, raw_password: str) -> None:
-        user.password_hash = generate_password_hash(raw_password)
