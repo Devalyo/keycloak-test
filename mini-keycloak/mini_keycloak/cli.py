@@ -15,6 +15,36 @@ from mini_keycloak.services.realm_import import RealmAlreadyExists, RealmImportS
 
 
 def register_cli(app: Flask) -> None:
+    @app.cli.command('admin-bootstrap')
+    @click.option('--username', required=True)
+    @click.password_option()
+    def admin_bootstrap(username: str, password: str) -> None:
+        try:
+            repository = IdentityRepository(db.session)
+            existing = repository.get_realm('master')
+            if existing is not None and any(
+                    user.username_normalized == username.strip().casefold()
+                    for user in repository.list_users(existing.id)):
+                raise ValueError()
+            document = {
+                'realm': 'master',
+                'enabled': True,
+                'attributes': {'mini.keycloak.passwordGrantEnabled': 'true'},
+                'clients': [{'clientId': 'admin-cli', 'enabled': True,
+                             'publicClient': True, 'directAccessGrantsEnabled': True}],
+                'users': [{'username': username, 'attributes': {'realmRoles': ['admin']},
+                           'credentials': [{'type': 'password', 'value': password}]}],
+            }
+            value = validate_realm_import(document, update=existing is not None).value
+            RealmImportService(
+                db.session, current_app.config['OIDC_KEY_ENCRYPTION_SECRET']
+            ).import_realm(value, update=existing is not None)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            raise click.ClickException('Admin bootstrap failed') from None
+        click.echo('master realm and admin identity are ready')
+
     def key_operation(realm_name: str, *, rotate: bool) -> None:
         try:
             realm = IdentityRepository(db.session).get_realm(realm_name)

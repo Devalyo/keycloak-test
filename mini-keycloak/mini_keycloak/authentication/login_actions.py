@@ -27,7 +27,7 @@ from mini_keycloak.authentication.required_actions import (
     RequiredActionRegistry,
 )
 from mini_keycloak.authentication.session_codes import (
-    PREAUTH_COOKIE_PREFIX, SessionCodeChecks,
+    PREAUTH_COOKIE_PREFIX, SessionCodeChecks, SessionContinuation,
 )
 from mini_keycloak.models import AuthenticationSession, Realm, User, UserSession
 from mini_keycloak.oidc.authorization import authorization_redirect
@@ -272,7 +272,9 @@ class LoginActionsService:
         if not enabled_realm.forgot_password_allowed:
             abort(400)
         checks = SessionCodeChecks(self.store)
-        authentication_session = checks.validate(realm)
+        authentication_session = checks.validate(
+            realm, require_session_code=request.method != "GET"
+        )
         if request.method == "POST":
             expected_execution = authentication_session.auth_notes.get(
                 CURRENT_AUTHENTICATION_EXECUTION
@@ -280,7 +282,11 @@ class LoginActionsService:
             if expected_execution is None:
                 raise ValueError("Invalid authentication request")
             authentication_session = checks.validate(realm, expected_execution)
-        session_code = checks.rotate(authentication_session)
+        session_code = (
+            SessionContinuation.replace(authentication_session)
+            if request.method == "GET"
+            else checks.rotate(authentication_session)
+        )
         processor = self._processor(realm, authentication_session, session_code)
         outcome = (
             processor.process_flow()

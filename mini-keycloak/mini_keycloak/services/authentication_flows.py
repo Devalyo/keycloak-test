@@ -37,3 +37,19 @@ class AuthenticationFlowService:
 
     def executions(self, flow_id: str) -> tuple[AuthenticationExecution, ...]:
         return self.repository.executions(flow_id)
+
+    def copy_flow(self, realm_id: str, source: AuthenticationFlow, alias: str) -> AuthenticationFlow:
+        if self.session.scalar(select(AuthenticationFlow.id).where(
+                AuthenticationFlow.realm_id == realm_id,
+                AuthenticationFlow.alias == alias)) is not None:
+            raise ValueError("Authentication flow already exists")
+        copy = AuthenticationFlow(realm_id=realm_id, alias=alias,
+                                  provider_id=source.provider_id, built_in=False)
+        self.session.add(copy)
+        self.session.flush()
+        for execution in self.executions(source.id):
+            self.session.add(AuthenticationExecution(
+                flow_id=copy.id, authenticator=execution.authenticator,
+                requirement=execution.requirement, priority=execution.priority))
+        self.session.flush()
+        return copy

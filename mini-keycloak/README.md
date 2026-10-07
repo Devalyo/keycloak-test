@@ -30,8 +30,63 @@ realm issuer override), never the request Host or forwarded headers.
 | GET, POST | `/protocol/openid-connect/logout` | RP logout; POST also supports legacy refresh logout |
 
 Only RS256, response type `code`, S256 PKCE, and the scopes `openid`, `profile`,
-and `email` are supported. Implicit flow, dynamic registration, roles, MFA, and
+and `email` are supported. Implicit flow, dynamic registration, general roles, MFA, and
 prompt/max_age options are not implemented.
+
+## Admin REST API
+
+The supported Keycloak-style management paths are:
+
+| Methods | Path |
+| --- | --- |
+| GET, POST | `/admin/realms` |
+| GET, PUT, DELETE | `/admin/realms/{realm}` |
+| GET | `/admin/realms/{realm}/authentication/flows` |
+| GET | `/admin/realms/{realm}/authentication/flows/{alias}/executions` |
+| POST | `/admin/realms/{realm}/authentication/flows/{alias}/copy` |
+| GET, POST | `/admin/realms/{realm}/clients` |
+| GET, PUT, DELETE | `/admin/realms/{realm}/clients/{client-uuid}` |
+| GET | `/admin/realms/{realm}/clients/{client-uuid}/session-count` |
+
+The client path uses the internal
+UUID returned in each client representation. Realm and client creation return
+`201` with a `Location` header; updates and deletion return `204`. The client
+list accepts `clientId`, `search`, `viewableOnly`, `q`, `first`, and `max` query
+parameters. Results are unpaged unless `max` is supplied. `search=true` applies a
+case-insensitive substring match to `clientId`; the default is an exact match.
+`q` filters exact client attribute names and values with space-separated
+`key:value` pairs.
+Flow copying accepts a JSON object with `newName`. A realm's
+`resetCredentialsFlow` field selects an existing flow by alias.
+The `smtpServer` realm setting accepts `host`, `port`, and `from` strings;
+an empty object keeps delivery in the local outbox only. Configured realms
+also send reset messages through the specified SMTP server.
+The master realm and its `admin-cli` client cannot be
+deleted through this API.
+
+After database migration, create the master realm, `admin-cli` client, and
+initial admin identity with a prompted password:
+
+```bash
+../.venv/bin/python -m flask --app mini_keycloak.app admin-bootstrap --username operator
+```
+
+The command creates the master realm if needed and adds a new admin identity;
+an existing username is rejected. Obtain an access token through
+`POST /realms/master/protocol/openid-connect/token` using the password grant,
+`client_id=admin-cli`, and the admin username and password. Send it as
+`Authorization: Bearer <access_token>` on every Admin REST request. An ordinary
+realm access token does not authorize the API. Removing the admin role from the
+user record or disabling its session immediately ends access.
+
+The request body is JSON with the supported realm import fields documented
+below. Realm creation can include clients and users. Realm updates merge listed
+fields and entities, preserving omitted data. Client creation and updates use
+the supported client fields from that same table. A client update keeps its
+`clientId` and internal UUID. Confidential client secrets are accepted on
+create or rotation and are omitted from responses. Unknown import fields are
+ignored. The API does not implement the full Keycloak administration surface,
+including roles, groups, service accounts, and fine-grained permissions.
 
 ## Browser code flow with PKCE
 
@@ -103,7 +158,7 @@ the same public failure for an unknown user and a wrong password.
 ## Realm JSON import
 
 The local CLI accepts the subset below of Keycloak 26.7.1-style realm JSON.
-It is not a complete Keycloak export importer or an administration API. From
+It is not a complete Keycloak export importer. From
 this directory, with the database configuration used by the server:
 
 ```bash
@@ -142,9 +197,10 @@ by letters, digits, `.`, `_`, or `-`, with no `..` sequence.
 
 | Object | Accepted fields and behavior |
 | --- | --- |
-| Realm identity | `realm` (required); `displayName` (nullable string); `enabled` (default `true`); `resetPasswordAllowed` (boolean, default `true`) |
+| Realm identity | `realm` (required); `displayName` (nullable string); `enabled` (default `true`); `resetPasswordAllowed` (boolean, default `true`); `resetCredentialsFlow` (existing flow alias, optional) |
 | Realm lifetimes | `accessTokenLifespan`, `accessCodeLifespan`, `ssoSessionIdleTimeout`, `ssoSessionMaxLifespan`: seconds, 1–2,147,483,647; omitted values use configured defaults |
 | Realm policy | `passwordPolicy`: raw policy string plus parsed known clauses; empty string clears the imported policy |
+| Realm mail | `smtpServer`: empty object or `host`, `port`, and `from` strings for SMTP delivery |
 | Realm collections | `clients`, `users`: arrays; `attributes`: string-valued object supporting only `mini.keycloak.passwordGrantEnabled` with string `"true"` or `"false"` (default `"false"`) |
 | Client identity/access | `clientId` (required); `name` (nullable); `enabled` (default `true`); `publicClient` (default `true`); `secret` (nonempty string, required for new confidential clients, forbidden for public clients) |
 | Client destinations | `redirectUris`, `webOrigins`: string arrays, default empty; exact URI restrictions below |
@@ -409,7 +465,7 @@ ordinary-login throttling, audit events, and expiry cleanup are implemented.
 PostgreSQL migrations/concurrency, JSON logs, strict request boundaries, private
 health probes, and the loopback TLS deployment have integration coverage.
 
-There is no administration UI/API, complete Keycloak export compatibility,
-federation, roles/groups, protocol mappers, MFA, dynamic client registration,
-implicit flow, upstream SMTP delivery, automatic key pruning, master-secret
+There is no administration UI or complete Keycloak Admin REST compatibility,
+federation, general roles/groups, protocol mappers, MFA, dynamic client registration,
+implicit flow, SMTP authentication and TLS, automatic key pruning, master-secret
 re-encryption, background cleanup scheduler, or high-availability guarantee.

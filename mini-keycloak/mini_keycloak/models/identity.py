@@ -56,6 +56,7 @@ class Realm(db.Model):
     )
     password_grant_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     password_policy: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    smtp_server: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     issuer_override: Mapped[str | None] = mapped_column(Text)
     access_token_lifetime_seconds: Mapped[int | None] = mapped_column(Integer)
     authorization_code_lifetime_seconds: Mapped[int | None] = mapped_column(Integer)

@@ -51,7 +51,7 @@ def test_reset_form_keeps_public_action_and_fields(db_app, authentication_sessio
     assert query_value(action, "execution") == execution_id
     assert query_value(action, "session_code") == "rotated-code"
     assert 'name="username"' in html
-    assert 'name="tryAnotherWay"' in html
+    assert 'name="tryAnotherWay"' not in html
 
 
 def test_update_password_form_keeps_public_action_and_fields(
