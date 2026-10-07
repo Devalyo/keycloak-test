@@ -15,6 +15,7 @@ _FAILURE_MESSAGES = {
     'token': 'Token request failed unexpectedly',
     'logout': 'Logout request failed unexpectedly',
     'browser': 'Browser request failed unexpectedly',
+    'admin': 'Admin request failed unexpectedly',
     'audit': 'Security event persistence failed',
     'health': 'Health readiness check failed',
 }

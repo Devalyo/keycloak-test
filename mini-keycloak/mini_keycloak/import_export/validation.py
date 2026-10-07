@@ -27,7 +27,7 @@ MAX_ATTRIBUTES = 64
 MAX_SECRET = 4096
 SUPPORTED_SCOPES = frozenset({"openid", "profile", "email"})
 REALM_FIELDS = frozenset({
-    "realm", "displayName", "enabled", "resetPasswordAllowed", "passwordPolicy",
+    "realm", "displayName", "enabled", "resetPasswordAllowed", "resetCredentialsFlow", "passwordPolicy", "smtpServer",
     "accessTokenLifespan", "accessCodeLifespan", "ssoSessionIdleTimeout",
     "ssoSessionMaxLifespan", "attributes", "clients", "users",
 })
@@ -266,6 +266,24 @@ class _Validator:
                     clauses[name] = int(argument)
         return PasswordPolicyImport(raw, MappingProxyType(clauses))
 
+    def smtp_server(self, value):
+        path = "$.smtpServer"
+        obj = self.obj(value, path, maximum=8)
+        for key in obj.keys() - {"host", "port", "from"}:
+            self.error(_path(path, key), "Unsupported SMTP setting")
+        if not obj:
+            return MappingProxyType({})
+        host = self.string(obj.get("host"), path + ".host", strip=True)
+        port = self.string(obj.get("port"), path + ".port", maximum=5, strip=True)
+        sender = self.string(obj.get("from"), path + ".from", maximum=320, strip=True)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]*", host):
+            self.error(path + ".host", "Invalid SMTP host")
+        if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+            self.error(path + ".port", "Invalid SMTP port")
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+", sender):
+            self.error(path + ".from", "Invalid sender address")
+        return MappingProxyType({"host": host, "port": port, "from": sender})
+
     def credential(self, value, path):
         obj = self.obj(value, path)
         self.unknown(obj, CREDENTIAL_FIELDS, path, reject=True)
@@ -363,8 +381,13 @@ class _Validator:
             display_name=self.string(obj.get("displayName"), "$.displayName", empty=True, nullable=True),
             enabled=self.boolean(obj, "enabled", "$", True),
             forgot_password_allowed=self.boolean(obj, "resetPasswordAllowed", "$", True),
+            reset_credentials_flow_alias=(
+                self.string(obj["resetCredentialsFlow"], "$.resetCredentialsFlow", strip=True)
+                if "resetCredentialsFlow" in obj else None
+            ),
             password_grant_enabled=grant == "true",
             password_policy=self.policy(obj.get("passwordPolicy", "")),
+            smtp_server=self.smtp_server(obj.get("smtpServer", {})),
             access_token_lifetime_seconds=self.lifetime(obj, "accessTokenLifespan"),
             authorization_code_lifetime_seconds=self.lifetime(obj, "accessCodeLifespan"),
             sso_idle_lifetime_seconds=self.lifetime(obj, "ssoSessionIdleTimeout"),

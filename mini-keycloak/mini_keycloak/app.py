@@ -11,6 +11,7 @@ from werkzeug.exceptions import HTTPException
 
 from mini_keycloak.authentication import browser
 from mini_keycloak.authentication.login_actions import LoginActionsService
+from mini_keycloak.admin import admin
 from mini_keycloak.cli import register_cli
 from mini_keycloak.config import Settings
 from mini_keycloak.extensions import db, migrate
@@ -64,6 +65,7 @@ def create_app(config: Mapping[str, Any] | None = None) -> Flask:
     register_cli(app)
     app.register_blueprint(oidc)
     app.register_blueprint(browser)
+    app.register_blueprint(admin)
     app.register_blueprint(health)
     register_hardening(app)
 

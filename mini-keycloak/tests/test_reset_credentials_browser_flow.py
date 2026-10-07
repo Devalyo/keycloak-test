@@ -1,4 +1,5 @@
 from datetime import timedelta
+import smtplib
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import pytest
@@ -38,6 +39,28 @@ def begin_reset(client, *, parameters=None):
     return tab_id, form_action(entry.text, 'login-actions/reset-credentials')
 
 
+def test_reset_entry_uses_browser_session_without_form_code(app, client):
+    authorization = client.get(AUTH, query_string=PARAMS)
+    login_action = form_action(authorization.text, 'login-actions/authenticate')
+    tab_id = query_value(login_action, 'tab_id')
+
+    response = client.get(RESET, query_string={
+        'client_id': 'demo-app', 'tab_id': tab_id,
+    })
+
+    assert response.status_code == 200
+    action = form_action(response.text, 'login-actions/reset-credentials')
+    assert query_value(action, 'client_id') == 'demo-app'
+    assert query_value(action, 'tab_id') == tab_id
+    assert query_value(action, 'session_code')
+    assert app.test_client().get(RESET, query_string={
+        'client_id': 'demo-app', 'tab_id': tab_id,
+    }).status_code == 400
+    assert client.get(RESET, query_string={
+        'client_id': 'another-client', 'tab_id': tab_id,
+    }).status_code == 400
+
+
 def send_reset(app, client, *, selector=False, parameters=None, return_response=False):
     tab_id, action = begin_reset(client, parameters=parameters)
     if selector:
@@ -52,6 +75,60 @@ def send_reset(app, client, *, selector=False, parameters=None, return_response=
         assert message is not None
         result = (tab_id, message.action_token, response)
         return result if return_response else result[:2]
+
+
+def test_reset_message_uses_realm_mail_settings(app, client, monkeypatch):
+    with app.app_context():
+        realm = IdentityRepository(db.session).get_realm('demo')
+        realm.smtp_server = {'host': 'mail.test', 'port': '1025',
+                             'from': 'no-reply@example.test'}
+        db.session.commit()
+    messages = []
+
+    class RecordingSMTP:
+        def __init__(self, host, port, timeout):
+            assert (host, port) == ('mail.test', 1025)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def send_message(self, message):
+            messages.append(message)
+
+    monkeypatch.setattr(smtplib, 'SMTP', RecordingSMTP)
+    _, token = send_reset(app, client)
+
+    assert len(messages) == 1
+    assert messages[0]['To'] == 'demo-user@example.test'
+    assert messages[0]['From'] == 'no-reply@example.test'
+    assert '/realms/demo/login-actions/action-token?key=' in messages[0].get_content()
+    assert token in messages[0].get_content()
+
+
+def test_reset_message_delivery_failure_keeps_browser_response(app, client, monkeypatch):
+    with app.app_context():
+        realm = IdentityRepository(db.session).get_realm('demo')
+        realm.smtp_server = {'host': 'mail.test', 'port': '1025',
+                             'from': 'no-reply@example.test'}
+        db.session.commit()
+    attempts = []
+
+    def unavailable(host, port, timeout):
+        attempts.append((host, port))
+        raise smtplib.SMTPException('unavailable')
+
+    monkeypatch.setattr(smtplib, 'SMTP', unavailable)
+    _, _, response = send_reset(app, client, return_response=True)
+    assert attempts == [('mail.test', 1025)]
+    assert response.status_code == 200
+    assert 'login-actions/authenticate' in response.text
+    with app.app_context():
+        event = db.session.scalar(select(SecurityEvent).where(
+            SecurityEvent.event_type == 'SEND_RESET_PASSWORD'))
+        assert event.error == 'email_send_failed'
 
 
 def password_action(app, client, *, parameters=None):
@@ -95,7 +172,7 @@ def test_reset_public_form_contract_and_realm_control(app, client, allowed):
     assert query_value(action, 'client_id') == 'demo-app'
     assert query_value(action, 'tab_id') == tab_id
     assert 'name="username"' in response.text
-    assert 'name="tryAnotherWay"' in response.text
+    assert 'name="tryAnotherWay"' not in response.text
     selector = client.post(action, data={'tryAnotherWay': ''})
     assert selector.status_code == 200
     selector_action = form_action(selector.text, 'login-actions/reset-credentials')
@@ -103,6 +180,7 @@ def test_reset_public_form_contract_and_realm_control(app, client, allowed):
     for name in ('client_id', 'tab_id', 'execution'):
         assert query_value(selector_action, name) == query_value(action, name)
     assert 'name="username"' in selector.text
+    assert 'id="kc-select-credential-form"' in selector.text
 
 
 @pytest.mark.parametrize('condition', ['missing_session_code', 'malformed_session_code',

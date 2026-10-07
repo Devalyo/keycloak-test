@@ -444,25 +444,6 @@ def test_authenticator_rejects_unavailable_selected_user(reset, stage, account):
     assert IdentityRepository(db.session).password_matches(user, "OriginalPassw0rd!")
 
 
-def test_email_action_marks_selected_user_verified(reset):
-    from mini_keycloak.authentication import AuthenticationFlowContext, FlowStatus
-    from mini_keycloak.authentication.constants import ACTION_TOKEN_USER_ID
-    from mini_keycloak.reset_credentials.authenticators import ResetCredentialEmail
-
-    realm, client, user, auth, executions = reset
-    user.email_verified = False
-    provider = ResetCredentialEmail(service())
-    context = AuthenticationFlowContext(
-        AuthenticationRepository(db.session), auth, realm, client, executions[1], provider
-    )
-    auth.auth_notes.pop(ACTION_TOKEN_USER_ID, None)
-
-    provider.action(context, {})
-
-    assert context.result.status == FlowStatus.SUCCESS
-    assert user.email_verified
-
-
 @pytest.mark.parametrize("password,confirmation,policy", [
     ("", "", {}), ("ChangedPassw0rd!", "different", {}),
     ("short", "short", {"clauses": {"length": 12}}),

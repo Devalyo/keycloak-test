@@ -71,6 +71,7 @@ class SessionCodeChecks:
         expected_execution: str | None = None,
         *,
         require_standard_flow: bool = True,
+        require_session_code: bool = True,
     ) -> AuthenticationSession:
         tab_id = request.args.get("tab_id", "")
         authentication_session = self.store.get_auth_session(tab_id)
@@ -94,11 +95,14 @@ class SessionCodeChecks:
                 authentication_session,
                 request.cookies.get(PREAUTH_COOKIE_PREFIX + tab_id, ""),
             )
-            or not SessionContinuation.verify(authentication_session, raw_code)
+            or (
+                require_session_code
+                and not SessionContinuation.verify(authentication_session, raw_code)
+            )
         ):
             raise ValueError("Invalid authentication request")
         self._validated_tab_id = authentication_session.tab_id
-        self._validated_code = raw_code
+        self._validated_code = raw_code if require_session_code else None
         return authentication_session
 
     def rotate(self, authentication_session: AuthenticationSession) -> str:

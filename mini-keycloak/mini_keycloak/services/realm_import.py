@@ -1,8 +1,10 @@
 """Apply validated realm imports within the caller's transaction."""
 
+from sqlalchemy import select
+
 from mini_keycloak.import_export.schema import RealmImport, ValidationIssue
 from mini_keycloak.import_export.validation import RealmImportValidationError
-from mini_keycloak.models import Client, Realm, User
+from mini_keycloak.models import AuthenticationFlow, Client, Realm, User
 from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.security.password_policy import password_satisfies_policy
 from mini_keycloak.services.clients import ClientService
@@ -46,6 +48,10 @@ class RealmAlreadyExists(RealmImportError):
     """Updating an existing realm requires explicit opt-in."""
 
 
+class ClientAlreadyExists(RealmImportError):
+    pass
+
+
 class RealmImportService:
     def __init__(self, session, master_secret):
         self.session = session
@@ -53,7 +59,8 @@ class RealmImportService:
         self.clients = ClientService(session)
         self.keys = RealmKeyService(session, master_secret)
 
-    def import_realm(self, value, *, update=False, preserve_existing_credentials=False):
+    def import_realm(self, value, *, update=False, preserve_existing_credentials=False,
+                     create_only_clients=False):
         """Flush one validated DTO; never commit, delete unlisted data, or log input.
 
         The caller owns the transaction. Failure rolls back that entire
@@ -71,7 +78,8 @@ class RealmImportService:
                 raise RealmImportError("A validated realm import is required")
             with self.session.no_autoflush:
                 realm, clients, users = self._preflight(
-                    value, update=update, preserve=preserve_existing_credentials)
+                    value, update=update, preserve=preserve_existing_credentials,
+                    create_only_clients=create_only_clients)
             creating = realm is None
             if creating:
                 realm = Realm(name=value.name)
@@ -80,6 +88,8 @@ class RealmImportService:
             if creating or "passwordPolicy" in value.present_fields:
                 realm.password_policy = {"raw": value.password_policy.raw,
                                          "clauses": dict(value.password_policy.clauses)}
+            if creating or "smtpServer" in value.present_fields:
+                realm.smtp_server = dict(value.smtp_server)
             if creating or "mini.keycloak.passwordGrantEnabled" in value.attributes:
                 realm.password_grant_enabled = value.password_grant_enabled
             # Release changing unique email slots together before assigning the
@@ -98,6 +108,15 @@ class RealmImportService:
                                  preserve_existing_credentials)
             self.keys.ensure_active_key(realm.id)
             AuthenticationFlowService(self.session).ensure_reset_flow(realm)
+            if "resetCredentialsFlow" in value.present_fields:
+                flow = self.session.scalar(select(AuthenticationFlow).where(
+                    AuthenticationFlow.realm_id == realm.id,
+                    AuthenticationFlow.alias == value.reset_credentials_flow_alias,
+                ))
+                if flow is None or flow.provider_id != "basic-flow":
+                    raise RealmImportValidationError([
+                        ValidationIssue("$.resetCredentialsFlow", "Authentication flow is unavailable")])
+                realm.reset_credentials_flow_id = flow.id
             self.session.flush()
             return realm
         except (RealmImportError, RealmImportValidationError) as exc:
@@ -117,7 +136,7 @@ class RealmImportService:
             value = client = user = None
         raise error from None
 
-    def _preflight(self, value, *, update, preserve):
+    def _preflight(self, value, *, update, preserve, create_only_clients):
         matches = self.repository.realms_with_normalized_name(value.name_normalized)
         if matches and not update:
             raise RealmAlreadyExists("Realm already exists; explicit update is required")
@@ -138,6 +157,8 @@ class RealmImportService:
 
         for index, client in enumerate(value.clients):
             existing = clients.get(client.client_id_normalized)
+            if existing is not None and create_only_clients:
+                raise ClientAlreadyExists("Client already exists")
             public = (client.public_client if existing is None or "publicClient" in client.present_fields
                       else existing.public_client)
             path = f"$.clients[{index}].secret"

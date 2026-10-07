@@ -16,7 +16,8 @@ EVENT_TYPES = frozenset({
 })
 ERRORS = frozenset({'invalid_request', 'invalid_credentials', 'invalid_client', 'invalid_grant',
                    'invalid_token', 'invalid_scope', 'unauthorized_client', 'access_denied',
-                   'unsupported_grant_type', 'temporarily_unavailable', 'server_error', 'refresh_reuse'})
+                   'unsupported_grant_type', 'temporarily_unavailable', 'server_error', 'refresh_reuse',
+                   'email_send_failed'})
 DETAIL_VALUES = {
     'grant_type': {'authorization_code', 'refresh_token', 'password'},
     'auth_method': {'none', 'client_secret_basic', 'client_secret_post'},

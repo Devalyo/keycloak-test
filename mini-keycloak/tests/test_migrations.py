@@ -84,11 +84,12 @@ def assert_flow_revision_round_trip(engine, migrate, *, completed_note=False):
     upgraded = MetaData()
     upgraded.reflect(engine)
     with engine.connect() as connection:
-        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0008'
+        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0009'
         assert compare_metadata(MigrationContext.configure(connection), db.metadata) == []
         realms = connection.execute(select(upgraded.tables['realms'])).mappings().all()
         assert len({row['reset_credentials_flow_id'] for row in realms}) == 2
         for realm in realms:
+            assert realm['smtp_server'] == {}
             flow = connection.execute(select(upgraded.tables['authentication_flows']).where(
                 upgraded.tables['authentication_flows'].c.id == realm['reset_credentials_flow_id']
             )).mappings().one()
@@ -329,7 +330,7 @@ def test_oidc_revision_preserves_existing_identity_and_downgrades_to_0001(tmp_pa
         connection.execute(text("INSERT INTO clients (id, realm_id, client_id, enabled, public_client, redirect_uris, web_origins, standard_flow_enabled, direct_access_grants_enabled) VALUES ('c', 'r', 'existing-client', 1, 1, '[]', '[]', 1, 0)"))
     migrate("upgrade", "head")
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0008"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0009"
         assert connection.scalar(text("SELECT password_grant_enabled FROM realms")) == 0
         assert connection.execute(text("SELECT name, enabled, forgot_password_allowed FROM realms")).one() == ("existing", 1, 1)
         assert connection.execute(text("SELECT client_id, direct_access_grants_enabled, pkce_policy FROM clients")).one() == ("existing-client", 0, "S256")

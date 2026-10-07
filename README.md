@@ -71,7 +71,9 @@ The ordinary OIDC provider supports authorization code with S256 PKCE, RS256
 tokens, refresh rotation/reuse revocation, userinfo, logout, and opt-in password
 grants. See the [OIDC guide](mini-keycloak/README.md) for protocol usage, bounded
 realm import, password policy, ordinary-login throttling, audit events, and
-session behavior. Live PostgreSQL migration/concurrency and fresh-volume TLS
+session behavior. The [Admin REST guide](mini-keycloak/README.md#admin-rest-api)
+covers realm and client management with an OIDC admin bearer token.
+Live PostgreSQL migration/concurrency and fresh-volume TLS
 deployment gates are implemented; their commands and limits are in the
 [deployment guide](mini-keycloak/docs/deployment.md#verification).
 

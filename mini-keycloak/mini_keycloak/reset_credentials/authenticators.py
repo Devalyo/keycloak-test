@@ -1,7 +1,9 @@
 """Account selection, reset-message delivery, and password completion."""
 
 from collections.abc import Mapping
+import smtplib
 
+from flask import current_app
 from sqlalchemy import select
 
 from mini_keycloak.authentication.constants import ACTION_TOKEN_USER_ID
@@ -9,6 +11,7 @@ from mini_keycloak.models import ResetEmail
 from mini_keycloak.repositories.identity import IdentityRepository
 from mini_keycloak.services.action_tokens import ResetActionTokenService
 from mini_keycloak.services.events import request_event
+from mini_keycloak.services.mail import send_password_reset
 from mini_keycloak.reset_credentials.update_password import UPDATE_PASSWORD
 
 
@@ -37,10 +40,11 @@ def _failure(context):
     context.failure(message="Invalid authentication request")
 
 
-def _event(context, user, event_type):
+def _event(context, user, event_type, *, error=None):
     request_event(context.repository.session, context.realm.id, event_type,
                   client_id=context.client.id, user_id=user.id,
-                  authentication_session_id=context.authentication_session.tab_id)
+                  authentication_session_id=context.authentication_session.tab_id,
+                  error=error)
 
 
 class ResetCredentialChooseUser:
@@ -77,8 +81,14 @@ class ResetCredentialEmail:
             if auth.auth_notes.get(RESET_EMAIL_DELIVERY) != delivery:
                 context.repository.update_session(auth, auth_notes={RESET_EMAIL_DELIVERY: delivery})
                 tokens = self.action_tokens or ResetActionTokenService(context.repository.session)
-                tokens.issue(auth, user)
-                _event(context, user, "SEND_RESET_PASSWORD")
+                message = tokens.issue(auth, user)
+                try:
+                    send_password_reset(context.realm, user, message.action_token,
+                                        current_app.config['EXTERNAL_URL'])
+                except (OSError, smtplib.SMTPException):
+                    _event(context, user, "SEND_RESET_PASSWORD", error='email_send_failed')
+                else:
+                    _event(context, user, "SEND_RESET_PASSWORD")
         context.fork(RESET_MESSAGE)
 
     def action(self, context, form: Mapping[str, str]):

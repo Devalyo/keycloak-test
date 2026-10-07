@@ -37,7 +37,7 @@ def register_hardening(app):
 
     @app.after_request
     def protocol_headers(response):
-        if request.blueprint == 'oidc':
+        if request.blueprint in {'oidc', 'admin'}:
             response.headers.update({'Cache-Control': 'no-store', 'Pragma': 'no-cache',
                 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'})
         if (request.blueprint == 'browser' or

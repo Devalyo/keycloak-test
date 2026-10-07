@@ -57,7 +57,11 @@ class LoginFormsProvider:
         )
 
     def create_select_authenticator(self, *, account: bool) -> str:
-        return self.create_password_reset(account=account)
+        return render_template(
+            "select-authenticator.html",
+            action=self._action("reset-credentials"),
+            account=account,
+        )
 
     def create_update_password(self, message: str = "") -> str:
         return render_template(

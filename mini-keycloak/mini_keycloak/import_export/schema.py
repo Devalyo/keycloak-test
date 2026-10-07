@@ -94,8 +94,10 @@ class RealmImport:
     display_name: str | None
     enabled: bool
     forgot_password_allowed: bool
+    reset_credentials_flow_alias: str | None
     password_grant_enabled: bool
     password_policy: PasswordPolicyImport
+    smtp_server: Mapping[str, str]
     access_token_lifetime_seconds: int | None
     authorization_code_lifetime_seconds: int | None
     sso_idle_lifetime_seconds: int | None
@@ -107,6 +109,7 @@ class RealmImport:
 
     def __post_init__(self):
         object.__setattr__(self, "attributes", MappingProxyType(dict(self.attributes)))
+        object.__setattr__(self, "smtp_server", MappingProxyType(dict(self.smtp_server)))
         object.__setattr__(self, "clients", tuple(self.clients))
         object.__setattr__(self, "users", tuple(self.users))
         object.__setattr__(self, "present_fields", frozenset(self.present_fields))
