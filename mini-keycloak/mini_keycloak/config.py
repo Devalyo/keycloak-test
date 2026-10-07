@@ -184,6 +184,7 @@ class Settings:
     login_failure_threshold: int = 5
     login_failure_window_seconds: int = 300
     login_lock_seconds: int = 60
+    reset_state_mode: str = 'notes'
 
     @classmethod
     def from_env(cls, *, overrides: Mapping[str, object] | None = None) -> Settings:
@@ -269,6 +270,8 @@ class Settings:
         normalized['trusted_proxy_cidrs'] = cidrs
         if self.log_level not in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
             raise _invalid('LOG_LEVEL')
+        if self.reset_state_mode not in ('typed', 'notes'):
+            raise _invalid('RESET_STATE_MODE')
         return replace(self, **normalized)
 
     def as_flask_config(self, *, overrides: Mapping[str, object] | None = None) -> dict[str, object]:

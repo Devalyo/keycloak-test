@@ -7,6 +7,9 @@ from mini_keycloak.authentication.required_actions import (
     RequiredActionStatus,
 )
 from mini_keycloak.repositories.identity import IdentityRepository
+from mini_keycloak.reset_credentials.progress import (
+    ResetProgress, clear_password_update, snapshot, state_mode,
+)
 from mini_keycloak.security.password_policy import password_satisfies_policy
 from mini_keycloak.services.events import request_event
 
@@ -21,15 +24,28 @@ def _failure() -> RequiredActionResult:
     )
 
 
+def _eligible_typed(progress: ResetProgress, provider_id: str) -> bool:
+    if not progress.user_enabled or not progress.email_verified:
+        return False
+    if progress.required_action != provider_id:
+        return False
+    if not progress.password_update_allowed:
+        return False
+    return True
+
+
 def _eligible(context: RequiredActionContext) -> bool:
     auth = context.authentication_session
     user = context.user
-    return bool(
-        user is not None
-        and user.enabled
-        and auth.required_actions
-        and auth.required_actions[0] == context.provider_id
-    )
+    if state_mode() == "typed":
+        return _eligible_typed(snapshot(auth, user), context.provider_id)
+    if user is None or not user.enabled or not user.email_verified:
+        return False
+    if not auth.required_actions or auth.required_actions[0] != context.provider_id:
+        return False
+    if auth.auth_notes.get("reset.password.pending") != "true":
+        return False
+    return True
 
 
 class UpdatePassword:
@@ -70,7 +86,7 @@ class UpdatePassword:
         user = context.user
         IdentityRepository(context.repository.session).set_password(user, password)
         auth = context.authentication_session
-        auth.password_update_allowed = False
+        clear_password_update(context.repository, auth)
         context.repository.update_session(auth, auth_notes={ACTION_TOKEN_USER_ID: None})
         for event_type in ("UPDATE_PASSWORD", "UPDATE_CREDENTIAL"):
             request_event(
