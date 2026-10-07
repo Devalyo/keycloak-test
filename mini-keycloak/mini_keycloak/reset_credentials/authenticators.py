@@ -4,11 +4,13 @@ from collections.abc import Mapping
 import smtplib
 
 from flask import current_app
-from sqlalchemy import select
 
 from mini_keycloak.authentication.constants import ACTION_TOKEN_USER_ID
-from mini_keycloak.models import ResetEmail
 from mini_keycloak.repositories.identity import IdentityRepository
+from mini_keycloak.reset_credentials.email_proof import validated_user
+from mini_keycloak.reset_credentials.progress import (
+    clear_password_update, schedule_password_update,
+)
 from mini_keycloak.services.action_tokens import ResetActionTokenService
 from mini_keycloak.services.events import request_event
 from mini_keycloak.services.mail import send_password_reset
@@ -18,22 +20,6 @@ from mini_keycloak.reset_credentials.update_password import UPDATE_PASSWORD
 ATTEMPTED_USERNAME = "attempted.username"
 RESET_EMAIL_DELIVERY = "reset.email.delivery"
 RESET_MESSAGE = "If the account exists, reset instructions have been sent."
-
-
-def _validated_user(context):
-    auth, user = context.authentication_session, context.user
-    if (user is None or not user.enabled
-            or auth.auth_notes.get(ACTION_TOKEN_USER_ID) != user.id):
-        return None
-    message = context.repository.session.scalar(select(ResetEmail.id).where(
-        ResetEmail.realm_id == context.realm.id,
-        ResetEmail.client_id == context.client.id,
-        ResetEmail.authentication_session_id == auth.tab_id,
-        ResetEmail.user_id == user.id,
-        ResetEmail.consumed_at.is_not(None),
-        ResetEmail.consumed.is_(True),
-    ).limit(1))
-    return user if message is not None else None
 
 
 def _failure(context):
@@ -59,7 +45,7 @@ class ResetCredentialChooseUser:
         user = IdentityRepository(context.repository.session).find_user(context.realm.id, identifier)
         auth = context.authentication_session
         auth.selected_user_id = user.id if user is not None else None
-        auth.password_update_allowed = False
+        clear_password_update(context.repository, auth)
         context.repository.update_session(auth, auth_notes={
             ATTEMPTED_USERNAME: identifier[:320], ACTION_TOKEN_USER_ID: None,
             RESET_EMAIL_DELIVERY: None})
@@ -71,7 +57,7 @@ class ResetCredentialEmail:
         self.action_tokens = action_tokens
 
     def authenticate(self, context):
-        if _validated_user(context) is not None:
+        if validated_user(context) is not None:
             context.success()
             return
         user = context.user
@@ -109,6 +95,8 @@ class ResetPassword:
         auth = context.authentication_session
         if UPDATE_PASSWORD not in auth.required_actions:
             auth.required_actions.append(UPDATE_PASSWORD)
+        user.email_verified = True
+        schedule_password_update(context.repository, auth)
         context.success()
 
     def action(self, context, form: Mapping[str, str]):
